@@ -3,6 +3,7 @@
  * section K.3 Typical Huffman tables for 8-bit precision luminance and chrominance
  */
 
+use alloc::collections::BinaryHeap;
 use alloc::vec::Vec;
 
 #[derive(Copy, Clone, Debug)]
@@ -97,61 +98,7 @@ impl HuffmanTable {
     /// Generates an optimized huffman table as described in Section K.2
     #[allow(clippy::needless_range_loop)]
     pub fn new_optimized(mut freq: [u32; 257]) -> HuffmanTable {
-        let mut others = [-1i32; 257];
-        let mut codesize = [0usize; 257];
-
-        // Find Huffman code sizes
-        // Figure K.1
-        loop {
-            let mut v1 = None;
-            let mut v1_min = u32::MAX;
-
-            // Find the largest value with the least non zero frequency
-            for (i, &f) in freq.iter().enumerate() {
-                if f > 0 && f <= v1_min {
-                    v1_min = f;
-                    v1 = Some(i);
-                }
-            }
-
-            let mut v1 = match v1 {
-                Some(v) => v,
-                None => break,
-            };
-
-            let mut v2 = None;
-            let mut v2_min = u32::MAX;
-
-            // Find the next largest value with the least non zero frequency
-            for (i, &f) in freq.iter().enumerate() {
-                if f > 0 && f <= v2_min && i != v1 {
-                    v2_min = f;
-                    v2 = Some(i);
-                }
-            }
-
-            let mut v2 = match v2 {
-                Some(v) => v,
-                None => break,
-            };
-
-            freq[v1] += freq[v2];
-            freq[v2] = 0;
-
-            codesize[v1] += 1;
-            while others[v1] >= 0 {
-                v1 = others[v1] as usize;
-                codesize[v1] += 1;
-            }
-
-            others[v1] = v2 as i32;
-
-            codesize[v2] += 1;
-            while others[v2] >= 0 {
-                v2 = others[v2] as usize;
-                codesize[v2] += 1;
-            }
-        }
+        let codesize = optimized_code_sizes(&mut freq);
 
         // Find the number of codes of each size
         // Figure K.2
@@ -193,18 +140,7 @@ impl HuffmanTable {
 
         // Sorting of input values according to code size
         // Figure K.4
-        let mut huffval = [0u8; 256];
-
-        let mut k = 0;
-
-        for i in 1..=32 {
-            for j in 0..=255 {
-                if codesize[j] == i {
-                    huffval[k] = j as u8;
-                    k += 1;
-                }
-            }
-        }
+        let (huffval, k) = values_by_code_size(&codesize);
 
         let mut length = [0u8; 16];
         for (i, v) in length.iter_mut().enumerate() {
@@ -285,4 +221,278 @@ fn create_lookup_table(code_length: &[u8; 16], values: &[u8]) -> [(u8, u16); 256
     }
 
     lookup_table
+}
+
+/// Symbols 0..=255 ordered by code size 1..=32, ascending symbol within a size,
+/// as Figure K.4's size-by-symbol double loop orders them. A counting sort
+/// visits each symbol once instead of once per size; sizes 0 and above 32 are
+/// left out, as there.
+fn values_by_code_size(codesize: &[usize; 257]) -> ([u8; 256], usize) {
+    // start[size] = number of symbols with a code size in 1..size
+    let mut start = [0usize; 34];
+    for &size in &codesize[..256] {
+        if (1..=32).contains(&size) {
+            start[size + 1] += 1;
+        }
+    }
+    for size in 2..34 {
+        start[size] += start[size - 1];
+    }
+    let count = start[33];
+    let mut huffval = [0u8; 256];
+    for (symbol, &size) in codesize[..256].iter().enumerate() {
+        if (1..=32).contains(&size) {
+            huffval[start[size]] = symbol as u8;
+            start[size] += 1;
+        }
+    }
+    (huffval, count)
+}
+
+/// The IJG merge order: least frequency first, highest symbol index on ties.
+fn optimized_code_sizes(freq: &mut [u32; 257]) -> [usize; 257] {
+    // A single integer comparison orders both fields. Inverted frequencies
+    // make BinaryHeap's maximum the least frequent remaining root; nine low
+    // bits retain the original highest-index tie break, including symbol 256.
+    let priority = |frequency: u32, index: usize| (u64::from(!frequency) << 9) | index as u64;
+    let mut roots: BinaryHeap<u64> = freq
+        .iter()
+        .enumerate()
+        .filter(|&(_, &f)| f != 0)
+        .map(|(i, &f)| priority(f, i))
+        .collect();
+    let mut others = [-1i32; 257];
+    let mut codesize = [0usize; 257];
+    while let Some(first) = roots.pop() {
+        let Some(second) = roots.pop() else {
+            break;
+        };
+        let root = (first & 511) as usize;
+        let mut v1 = root;
+        let mut v2 = (second & 511) as usize;
+        freq[v1] += freq[v2];
+        freq[v2] = 0;
+        // Keep the original positive-frequency rule even if a release-build
+        // u32 merge wraps to zero; that root must then leave the active set.
+        if freq[root] != 0 {
+            roots.push(priority(freq[root], root));
+        }
+
+        codesize[v1] += 1;
+        while others[v1] >= 0 {
+            v1 = others[v1] as usize;
+            codesize[v1] += 1;
+        }
+        others[v1] = v2 as i32;
+        codesize[v2] += 1;
+        while others[v2] >= 0 {
+            v2 = others[v2] as usize;
+            codesize[v2] += 1;
+        }
+    }
+    codesize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reference_code_sizes(mut freq: [u32; 257]) -> [usize; 257] {
+        let mut others = [-1i32; 257];
+        let mut codesize = [0usize; 257];
+
+        // Find Huffman code sizes
+        // Figure K.1
+        loop {
+            let mut v1 = None;
+            let mut v1_min = u32::MAX;
+
+            // Find the largest value with the least non zero frequency
+            for (i, &f) in freq.iter().enumerate() {
+                if f > 0 && f <= v1_min {
+                    v1_min = f;
+                    v1 = Some(i);
+                }
+            }
+
+            let mut v1 = match v1 {
+                Some(v) => v,
+                None => break,
+            };
+
+            let mut v2 = None;
+            let mut v2_min = u32::MAX;
+
+            // Find the next largest value with the least non zero frequency
+            for (i, &f) in freq.iter().enumerate() {
+                if f > 0 && f <= v2_min && i != v1 {
+                    v2_min = f;
+                    v2 = Some(i);
+                }
+            }
+
+            let mut v2 = match v2 {
+                Some(v) => v,
+                None => break,
+            };
+
+            freq[v1] += freq[v2];
+            freq[v2] = 0;
+
+            codesize[v1] += 1;
+            while others[v1] >= 0 {
+                v1 = others[v1] as usize;
+                codesize[v1] += 1;
+            }
+
+            others[v1] = v2 as i32;
+
+            codesize[v2] += 1;
+            while others[v2] >= 0 {
+                v2 = others[v2] as usize;
+                codesize[v2] += 1;
+            }
+        }
+
+        codesize
+    }
+
+    /// The original Figure K.4 double loop.
+    #[allow(clippy::needless_range_loop)]
+    fn reference_values_by_code_size(codesize: &[usize; 257]) -> ([u8; 256], usize) {
+        let mut huffval = [0u8; 256];
+        let mut k = 0;
+        for i in 1..=32 {
+            for j in 0..=255 {
+                if codesize[j] == i {
+                    huffval[k] = j as u8;
+                    k += 1;
+                }
+            }
+        }
+        (huffval, k)
+    }
+
+    #[test]
+    fn counting_sort_matches_figure_k4_order() {
+        let check = |codesize: [usize; 257]| {
+            assert_eq!(
+                values_by_code_size(&codesize),
+                reference_values_by_code_size(&codesize),
+                "{codesize:?}"
+            );
+        };
+        check([0; 257]);
+        check([1; 257]);
+        check([32; 257]);
+        check([33; 257]);
+        for size in 0..=40 {
+            for symbol in [0, 1, 127, 254, 255, 256] {
+                let mut codesize = [0; 257];
+                codesize[symbol] = size;
+                check(codesize);
+            }
+        }
+        let mut seed = 0x0bad_5eedu32;
+        for case in 0..4096 {
+            let codesize = core::array::from_fn(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let r = (seed >> 8) as usize;
+                match case % 4 {
+                    0 => r % 34,
+                    1 => {
+                        if r % 3 == 0 {
+                            0
+                        } else {
+                            1 + r % 16
+                        }
+                    }
+                    2 => r % 3 + 7,
+                    _ => r % 64,
+                }
+            });
+            check(codesize);
+        }
+        // Real histograms through the merge, before and after length limiting
+        let mut seed = 0x31415926u32;
+        for case in 0..1024 {
+            let mut freq: [u32; 257] = core::array::from_fn(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                match case % 3 {
+                    0 => seed % 4,
+                    1 => 1 << (seed % 20),
+                    _ => {
+                        if seed & 7 == 0 {
+                            seed % 10000
+                        } else {
+                            0
+                        }
+                    }
+                }
+            });
+            freq[256] = 1;
+            check(optimized_code_sizes(&mut freq));
+        }
+    }
+
+    #[test]
+    fn heap_preserves_original_merge_order() {
+        let check = |freq: [u32; 257]| {
+            let mut actual = freq;
+            assert_eq!(
+                optimized_code_sizes(&mut actual),
+                reference_code_sizes(freq)
+            );
+        };
+        // Equal counts exercise the highest-index tie break, including the
+        // pseudo-symbol that prevents an all-ones Huffman code.
+        check([1; 257]);
+        check([0; 257]);
+        for count in 1..=257 {
+            let mut freq = [0; 257];
+            freq[..count].fill(1);
+            check(freq);
+        }
+        for symbol in 0..256 {
+            let mut freq = [0; 257];
+            freq[symbol] = 100000;
+            freq[256] = 1;
+            check(freq);
+        }
+        let mut seed = 0x31415926u32;
+        for case in 0..1024 {
+            let mut freq = core::array::from_fn(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                match case % 4 {
+                    0 => seed % 4,
+                    1 => {
+                        if seed & 7 == 0 {
+                            seed % 10000
+                        } else {
+                            0
+                        }
+                    }
+                    2 => seed % 1000000,
+                    _ => 1 << (seed % 20),
+                }
+            });
+            freq[256] = 1;
+            check(freq);
+        }
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn wrapped_zero_frequency_leaves_the_active_set() {
+        let mut frequencies = [0; 257];
+        frequencies[0] = u32::MAX;
+        frequencies[1] = u32::MAX;
+        frequencies[2] = u32::MAX;
+        frequencies[256] = 1;
+        let mut actual = frequencies;
+        assert_eq!(
+            optimized_code_sizes(&mut actual),
+            reference_code_sizes(frequencies)
+        );
+    }
 }

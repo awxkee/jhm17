@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use jpeg_encoder::*;
+use jhm17::*;
 
 fuzz_target!(|data: &[u8]| {
 

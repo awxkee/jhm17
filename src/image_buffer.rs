@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use crate::encoder::JpegColorType;
+use crate::encoder::{JpegColorType, SamplePrecision};
 
 /// Conversion from RGB to YCbCr
 #[inline]
@@ -48,7 +48,7 @@ pub fn cmyk_to_ycck(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8, u8) {
 /// ## Example: ImageBuffer implementation for RgbImage from the `image` crate
 /// ```no_compile
 /// use image::RgbImage;
-/// use jpeg_encoder::{ImageBuffer, JpegColorType, rgb_to_ycbcr};
+/// use jhm17::{ImageBuffer, JpegColorType, rgb_to_ycbcr};
 ///
 /// pub struct RgbImageBuffer {
 ///     image: RgbImage,
@@ -95,6 +95,25 @@ pub trait ImageBuffer {
 
     /// Add color values for the row to color component buffers
     fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]);
+
+    /// Whether this buffer can provide fractional component samples.
+    fn supports_precise_samples(&self) -> bool {
+        false
+    }
+
+    /// Append a row of unsigned Q8 component samples (`sample * 256`).
+    ///
+    /// Return `true` after appending the row. Return `false` without changing
+    /// any buffer when this input or precision mode is unsupported. The default
+    /// preserves the byte-sample path for existing custom implementations.
+    fn fill_buffers_precise(
+        &self,
+        _y: u16,
+        _buffers: &mut [Vec<u16>; 4],
+        _precision: SamplePrecision,
+    ) -> bool {
+        false
+    }
 }
 
 pub(crate) struct GrayImage<'a>(pub &'a [u8], pub u16, pub u16);
@@ -122,7 +141,7 @@ impl<'a> ImageBuffer for GrayImage<'a> {
 }
 
 #[inline(always)]
-fn get_line(data: &[u8], y: u16, width: u16, num_colors: usize) -> &[u8] {
+pub(crate) fn get_line(data: &[u8], y: u16, width: u16, num_colors: usize) -> &[u8] {
     let width = usize::from(width);
     let y = usize::from(y);
 
@@ -130,6 +149,71 @@ fn get_line(data: &[u8], y: u16, width: u16, num_colors: usize) -> &[u8] {
     let end = start + width * num_colors;
 
     &data[start..end]
+}
+
+#[inline(always)]
+pub(crate) fn rgb_to_ycbcr_q8(r: u8, g: u8, b: u8, precise_chroma: bool) -> (u16, u16, u16) {
+    let (r, g, b) = (i32::from(r), i32::from(g), i32::from(b));
+    let y = 19595 * r + 38470 * g + 7471 * b;
+    let cb = -11059 * r - 21709 * g + 32768 * b + (128 << 16);
+    let cr = 32768 * r - 27439 * g - 5329 * b + (128 << 16);
+    let y = ((y + 127) >> 8) as u16;
+    let (cb, cr) = if precise_chroma {
+        (((cb + 127) >> 8) as u16, ((cr + 127) >> 8) as u16)
+    } else {
+        // Match the existing byte conversion, including its half-step ties.
+        (
+            (((cb + 0x7fff) >> 16) as u16) << 8,
+            (((cr + 0x7fff) >> 16) as u16) << 8,
+        )
+    };
+    (y, cb, cr)
+}
+
+/// Scalar RGB-family conversion retaining fractional component samples.
+#[inline]
+pub(crate) fn fill_precise_rgb<const N: usize, const R: usize, const G: usize, const B: usize>(
+    data: &[u8],
+    y: u16,
+    width: u16,
+    buffers: &mut [Vec<u16>; 4],
+    precision: SamplePrecision,
+) -> bool {
+    let precise_chroma = match precision {
+        SamplePrecision::Integer => return false,
+        SamplePrecision::Luma => false,
+        SamplePrecision::All => true,
+    };
+    let line = get_line(data, y, width, N);
+    let [ys, cbs, crs, _] = buffers;
+    ys.reserve(usize::from(width));
+    cbs.reserve(usize::from(width));
+    crs.reserve(usize::from(width));
+    const CHUNK: usize = 16;
+    let mut y_chunk = [0u16; CHUNK];
+    let mut cb_chunk = [0u16; CHUNK];
+    let mut cr_chunk = [0u16; CHUNK];
+    let mut chunks = line.chunks_exact(N * CHUNK);
+    for chunk in &mut chunks {
+        for i in 0..CHUNK {
+            (y_chunk[i], cb_chunk[i], cr_chunk[i]) = rgb_to_ycbcr_q8(
+                chunk[i * N + R],
+                chunk[i * N + G],
+                chunk[i * N + B],
+                precise_chroma,
+            );
+        }
+        ys.extend_from_slice(&y_chunk);
+        cbs.extend_from_slice(&cb_chunk);
+        crs.extend_from_slice(&cr_chunk);
+    }
+    for pixel in chunks.remainder().as_chunks::<N>().0.iter() {
+        let (y, cb, cr) = rgb_to_ycbcr_q8(pixel[R], pixel[G], pixel[B], precise_chroma);
+        ys.push(y);
+        cbs.push(cb);
+        crs.push(cr);
+    }
+    true
 }
 
 macro_rules! ycbcr_image {
@@ -147,6 +231,25 @@ macro_rules! ycbcr_image {
 
             fn height(&self) -> u16 {
                 self.2
+            }
+
+            fn supports_precise_samples(&self) -> bool {
+                true
+            }
+
+            fn fill_buffers_precise(
+                &self,
+                y: u16,
+                buffers: &mut [Vec<u16>; 4],
+                precision: SamplePrecision,
+            ) -> bool {
+                fill_precise_rgb::<$num_colors, $o1, $o2, $o3>(
+                    self.0,
+                    y,
+                    self.width(),
+                    buffers,
+                    precision,
+                )
             }
 
             #[inline(always)]
@@ -221,7 +324,7 @@ impl<'a> ImageBuffer for YCbCrImage<'a> {
     fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
         let line = get_line(self.0, y, self.width(), 3);
 
-        for pixel in line.chunks_exact(3) {
+        for pixel in line.as_chunks::<3>().0 {
             buffers[0].push(pixel[0]);
             buffers[1].push(pixel[1]);
             buffers[2].push(pixel[2]);
@@ -247,7 +350,7 @@ impl<'a> ImageBuffer for CmykImage<'a> {
     fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
         let line = get_line(self.0, y, self.width(), 4);
 
-        for pixel in line.chunks_exact(4) {
+        for pixel in line.as_chunks::<4>().0 {
             buffers[0].push(255 - pixel[0]);
             buffers[1].push(255 - pixel[1]);
             buffers[2].push(255 - pixel[2]);
@@ -274,7 +377,7 @@ impl<'a> ImageBuffer for CmykAsYcckImage<'a> {
     fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
         let line = get_line(self.0, y, self.width(), 4);
 
-        for pixel in line.chunks_exact(4) {
+        for pixel in line.as_chunks::<4>().0 {
             let (y, cb, cr, k) = cmyk_to_ycck(pixel[0], pixel[1], pixel[2], pixel[3]);
 
             buffers[0].push(y);
@@ -303,7 +406,7 @@ impl<'a> ImageBuffer for YcckImage<'a> {
     fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
         let line = get_line(self.0, y, self.width(), 4);
 
-        for pixel in line.chunks_exact(4) {
+        for pixel in line.as_chunks::<4>().0 {
             buffers[0].push(pixel[0]);
             buffers[1].push(pixel[1]);
             buffers[2].push(pixel[2]);
@@ -313,8 +416,182 @@ impl<'a> ImageBuffer for YcckImage<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use super::*;
     use crate::rgb_to_ycbcr;
+
+    #[cfg(any(
+        all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")),
+        all(feature = "neon", target_arch = "aarch64")
+    ))]
+    pub(crate) fn check_simd_rows(mut check: impl FnMut(&[u8], &[u8], u16, u16)) {
+        for width in (0..=65).chain([127, 128, 129, 515, u16::MAX]) {
+            let height = 2;
+            let mut state = 0x9e3779b9u32;
+            // A leading byte exercises unaligned input. Include endpoint and
+            // half-step colors as well as independently varying random channels.
+            let colors = (0..usize::from(width) * usize::from(height)).map(|i| {
+                let edges = [
+                    [0, 0, 0],
+                    [255, 255, 255],
+                    [255, 0, 0],
+                    [0, 255, 0],
+                    [0, 0, 255],
+                    [255, 255, 0],
+                    [0, 255, 255],
+                    [255, 0, 255],
+                    [59, 109, 6],
+                    [0, 1, 0],
+                    [255, 254, 255],
+                ];
+                if i % 23 < edges.len() {
+                    edges[i % 23]
+                } else {
+                    core::array::from_fn(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        (state >> 24) as u8
+                    })
+                }
+            });
+            let mut rgb = alloc::vec![73];
+            let mut rgba = alloc::vec![91];
+            for [r, g, b] in colors {
+                rgb.extend_from_slice(&[r, g, b]);
+                rgba.extend_from_slice(&[r, g, b, (r ^ b).wrapping_add(g)]);
+            }
+            check(&rgb[1..], &rgba[1..], width, height);
+        }
+    }
+
+    #[cfg(any(
+        all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")),
+        all(feature = "neon", target_arch = "aarch64")
+    ))]
+    pub(crate) fn check_simd_image(simd: &dyn ImageBuffer, scalar: &dyn ImageBuffer) {
+        // Independent initial lengths and no spare capacity exercise reserve,
+        // appending to existing data, and preservation of the fourth channel.
+        let mut bytes = core::array::from_fn(|c| alloc::vec![c as u8; c + 1]);
+        let mut expected = bytes.clone();
+        for row in [1, 0] {
+            simd.fill_buffers(row, &mut bytes);
+            scalar.fill_buffers(row, &mut expected);
+            assert_eq!(bytes, expected, "byte samples, width {}", simd.width());
+        }
+        for precision in [
+            SamplePrecision::Integer,
+            SamplePrecision::Luma,
+            SamplePrecision::All,
+        ] {
+            let mut actual = core::array::from_fn(|c| alloc::vec![60000 + c as u16; c + 1]);
+            let mut expected = actual.clone();
+            for row in [1, 0] {
+                assert_eq!(
+                    simd.fill_buffers_precise(row, &mut actual, precision),
+                    scalar.fill_buffers_precise(row, &mut expected, precision),
+                );
+                assert_eq!(actual, expected, "{precision:?}, width {}", simd.width());
+            }
+        }
+    }
+
+    #[test]
+    fn precise_rgb_rows_preserve_channel_order_tails_and_append() {
+        for width in [1u16, 7, 16, 17, 31, 32, 33] {
+            let colors: Vec<[u8; 3]> = (0..usize::from(width) * 3)
+                .map(|i| [(i * 37) as u8, (i * 83 + 17) as u8, (i * 13 + 251) as u8])
+                .collect();
+            let rgb: Vec<u8> = colors.iter().flatten().copied().collect();
+            let rgba: Vec<u8> = colors.iter().flat_map(|c| [c[0], c[1], c[2], 99]).collect();
+            let bgr: Vec<u8> = colors.iter().flat_map(|c| [c[2], c[1], c[0]]).collect();
+            let bgra: Vec<u8> = colors.iter().flat_map(|c| [c[2], c[1], c[0], 11]).collect();
+            let images: [&dyn ImageBuffer; 4] = [
+                &RgbImage(&rgb, width, 3),
+                &RgbaImage(&rgba, width, 3),
+                &BgrImage(&bgr, width, 3),
+                &BgraImage(&bgra, width, 3),
+            ];
+            for image in images {
+                assert!(image.supports_precise_samples());
+                for precision in [SamplePrecision::Luma, SamplePrecision::All] {
+                    let mut out: [Vec<u16>; 4] = core::array::from_fn(|c| alloc::vec![c as u16]);
+                    let mut expected = out.clone();
+                    for row in [2u16, 0] {
+                        assert!(image.fill_buffers_precise(row, &mut out, precision));
+                        for &[r, g, b] in
+                            &colors[usize::from(row * width)..usize::from((row + 1) * width)]
+                        {
+                            // Independent i64 matrix reference, including the channel offset.
+                            let input = [i64::from(r), i64::from(g), i64::from(b), 1];
+                            let matrix = [
+                                [19595, 38470, 7471, 0],
+                                [-11059, -21709, 32768, 128 << 16],
+                                [32768, -27439, -5329, 128 << 16],
+                            ];
+                            for c in 0..3 {
+                                let raw: i64 =
+                                    input.iter().zip(matrix[c]).map(|(x, k)| x * k).sum();
+                                let value = if c == 0 || matches!(precision, SamplePrecision::All) {
+                                    ((raw + 127) >> 8) as u16
+                                } else {
+                                    (((raw + 0x7fff) >> 16) as u16) << 8
+                                };
+                                expected[c].push(value);
+                            }
+                        }
+                    }
+                    assert_eq!(out, expected);
+                }
+                let mut untouched = core::array::from_fn(|c| alloc::vec![c as u16, 60000]);
+                let before = untouched.clone();
+                assert!(!image.fill_buffers_precise(0, &mut untouched, SamplePrecision::Integer));
+                assert_eq!(untouched, before);
+            }
+        }
+    }
+
+    #[test]
+    fn precise_constant_colors_keep_fractional_values_and_endpoints() {
+        for color in [
+            [0, 0, 0],
+            [255, 255, 255],
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [59, 109, 6],
+        ] {
+            let pixels = color.repeat(19);
+            let image = RgbImage(&pixels, 19, 1);
+            let mut out: [Vec<u16>; 4] = Default::default();
+            assert!(image.fill_buffers_precise(0, &mut out, SamplePrecision::All));
+            let rgb: [f64; 3] = color.map(f64::from);
+            let reference = [
+                0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2],
+                -0.16874 * rgb[0] - 0.33126 * rgb[1] + 0.5 * rgb[2] + 128.0,
+                0.5 * rgb[0] - 0.41869 * rgb[1] - 0.08131 * rgb[2] + 128.0,
+            ];
+            for c in 0..3 {
+                assert!(out[c].iter().all(|&v| v == out[c][0]));
+                assert!((f64::from(out[c][0]) / 256.0 - reference[c]).abs() < 1.0 / 128.0);
+            }
+            let mut luma: [Vec<u16>; 4] = Default::default();
+            assert!(image.fill_buffers_precise(0, &mut luma, SamplePrecision::Luma));
+            let (_, cb, cr) = rgb_to_ycbcr(color[0], color[1], color[2]);
+            assert_eq!(luma[0], out[0]);
+            assert!(luma[1].iter().all(|&v| v == u16::from(cb) << 8));
+            assert!(luma[2].iter().all(|&v| v == u16::from(cr) << 8));
+            if color == [255, 0, 0] {
+                assert_eq!(out[2][0], 65408);
+            }
+        }
+        let mut out = core::array::from_fn(|c| alloc::vec![c as u16]);
+        let before = out.clone();
+        let gray = GrayImage(&[7], 1, 1);
+        assert!(!gray.supports_precise_samples());
+        assert!(!gray.fill_buffers_precise(0, &mut out, SamplePrecision::All));
+        assert_eq!(out, before);
+    }
 
     fn assert_rgb_to_ycbcr(rgb: [u8; 3], ycbcr: [u8; 3]) {
         let (y, cb, cr) = rgb_to_ycbcr(rgb[0], rgb[1], rgb[2]);

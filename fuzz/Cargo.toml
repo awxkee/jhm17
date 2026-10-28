@@ -1,9 +1,8 @@
 [package]
-name = "jpeg-encoder-fuzz"
+name = "jhm17-fuzz"
 version = "0.0.0"
-authors = ["Automatically generated"]
 publish = false
-edition = "2021"
+edition = "2024"
 
 [package.metadata]
 cargo-fuzz = true
@@ -11,52 +10,54 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.jpeg-encoder]
+[dependencies.jhm17]
 path = ".."
-features = ["simd"]
-
-# Prevent this from interfering with workspaces
-[workspace]
-members = ["."]
 
 [[bin]]
 name = "encode_rgb"
 path = "fuzz_targets/encode_rgb.rs"
 test = false
 doc = false
+bench = false
 
 [[bin]]
 name = "encode_ycck_progressive"
 path = "fuzz_targets/encode_ycck_progressive.rs"
 test = false
 doc = false
+bench = false
 
 [[bin]]
 name = "encode_rgb_optimized"
 path = "fuzz_targets/encode_rgb_optimized.rs"
 test = false
 doc = false
+bench = false
 
 [[bin]]
 name = "encode_rgb_custom_q_table"
 path = "fuzz_targets/encode_rgb_custom_q_table.rs"
 test = false
 doc = false
+bench = false
 
 [[bin]]
 name = "encode_rgb_subsampled"
 path = "fuzz_targets/encode_rgb_subsampled.rs"
 test = false
 doc = false
+bench = false
 
 [[bin]]
 name = "encode_rgb_subsampled_average"
 path = "fuzz_targets/encode_rgb_subsampled_average.rs"
 test = false
 doc = false
+bench = false
 
 [[bin]]
 name = "encode_rgb_progressive"
 path = "fuzz_targets/encode_rgb_progressive.rs"
 test = false
 doc = false
+bench = false

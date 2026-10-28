@@ -2,9 +2,9 @@
 //!
 //! ## Using the encoder
 //! ```no_run
-//! # use jpeg_encoder::EncodingError;
+//! # use jhm17::EncodingError;
 //! # pub fn main() -> Result<(), EncodingError> {
-//! use jpeg_encoder::{Encoder, ColorType};
+//! use jhm17::{Encoder, ColorType};
 //!
 //! // An array with 4 pixels in RGB format.
 //! let data = [
@@ -22,51 +22,36 @@
 //! # Ok(())
 //! # }
 
-#![no_std]
-#![cfg_attr(not(feature = "simd"), forbid(unsafe_code))]
-
-#[cfg(feature = "std")]
-extern crate std;
-
 extern crate alloc;
-extern crate core;
 
-#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
 mod avx2;
+mod clip;
+mod dct_f32;
 mod encoder;
 mod error;
 mod fdct;
 mod huffman;
 mod image_buffer;
 mod marker;
+#[cfg(all(feature = "neon", target_arch = "aarch64"))]
+mod neon;
+mod progressive;
 mod quantization;
+mod rdo;
 mod writer;
 
-pub use encoder::{ChromaSubsamplingMethod, ColorType, Encoder, JpegColorType, SamplingFactor};
+pub use clip::ClipOptions;
+pub use encoder::{
+    ChromaSubsamplingMethod, ColorType, DEFAULT_LUMA_BANDS, Encoder, JpegColorType,
+    SUBSAMPLED_CB_SCALE, SamplePrecision, SamplingFactor,
+};
 pub use error::EncodingError;
 pub use image_buffer::{ImageBuffer, cmyk_to_ycck, rgb_to_ycbcr};
-pub use quantization::QuantizationTableType;
+pub use progressive::ProgressiveMode;
+pub use quantization::{Deadzone, QuantizationTableType, StepTuning};
+pub use rdo::RdoOptions;
 pub use writer::{JfifWrite, PixelDensity, PixelDensityUnit};
-
-#[cfg(feature = "benchmark")]
-pub use fdct::fdct;
-
-#[cfg(feature = "benchmark")]
-pub use image_buffer::RgbImage;
-
-#[cfg(all(
-    feature = "benchmark",
-    feature = "simd",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
-pub use avx2::fdct_avx2;
-
-#[cfg(all(
-    feature = "benchmark",
-    feature = "simd",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
-pub use avx2::RgbImageAVX2;
 
 #[cfg(test)]
 mod tests {
@@ -81,7 +66,7 @@ mod tests {
     use alloc::vec::Vec;
 
     fn create_test_img_rgb() -> (Vec<u8>, u16, u16) {
-        // Ensure size which which ensures an odd MCU count per row to test chroma subsampling
+        // Ensure size which ensures an odd MCU count per row to test chroma subsampling
         let width = 258;
         let height = 128;
 

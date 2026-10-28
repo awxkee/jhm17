@@ -416,7 +416,7 @@ fn fdct_avx2_internal(data: &mut AlignedBlock) {
 
     let data = &mut data.data;
 
-    let ymm4 = avx_load(&data[0..16]);
+    let ymm4 = avx_load(&data[..16]);
     let ymm5 = avx_load(&data[16..32]);
     let ymm6 = avx_load(&data[32..48]);
     let ymm7 = avx_load(&data[48..64]);
@@ -453,7 +453,7 @@ fn fdct_avx2_internal(data: &mut AlignedBlock) {
     let ymm6 = _mm256_permute2x128_si256(ymm0, ymm4, 0x31); // ymm6=data4_5
     let ymm7 = _mm256_permute2x128_si256(ymm2, ymm4, 0x21); // ymm7=data6_7
 
-    avx_store(ymm3, &mut data[0..16]);
+    avx_store(ymm3, &mut data[..16]);
     avx_store(ymm5, &mut data[16..32]);
     avx_store(ymm6, &mut data[32..48]);
     avx_store(ymm7, &mut data[48..64]);

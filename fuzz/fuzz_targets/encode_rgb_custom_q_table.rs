@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use jpeg_encoder::*;
+use jhm17::*;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() >= 128 + 3 {

@@ -20,14 +20,12 @@ pub enum EncodingError {
     ZeroImageDimensions { width: u16, height: u16 },
 
     /// An io error occurred during writing
-    #[cfg(feature = "std")]
     IoError(std::io::Error),
 
-    /// An io error occurred during writing (Should be used in no_std cases instead of IoError)
+    /// An error reported by a custom output sink
     Write(alloc::string::String),
 }
 
-#[cfg(feature = "std")]
 impl From<std::io::Error> for EncodingError {
     fn from(err: std::io::Error) -> EncodingError {
         EncodingError::IoError(err)
@@ -57,7 +55,6 @@ impl Display for EncodingError {
             ZeroImageDimensions { width, height } => {
                 write!(f, "Image dimensions must be non zero: {}x{}", width, height)
             }
-            #[cfg(feature = "std")]
             IoError(err) => err.fmt(f),
             Write(err) => write!(f, "{}", err),
         }
@@ -65,7 +62,6 @@ impl Display for EncodingError {
 }
 
 impl Error for EncodingError {
-    #[cfg(feature = "std")]
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             EncodingError::IoError(err) => Some(err),

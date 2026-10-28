@@ -1,148 +1,243 @@
 #[cfg(target_arch = "x86")]
-use core::arch::x86::{
-    __m256i, _mm_cvtsi128_si64, _mm256_add_epi32, _mm256_castsi256_si128, _mm256_mullo_epi32,
-    _mm256_permutevar8x32_epi32, _mm256_set1_epi32, _mm256_setr_epi32, _mm256_shuffle_epi8,
-    _mm256_sub_epi32,
-};
-
+use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{
-    __m256i, _mm_cvtsi128_si64, _mm256_add_epi32, _mm256_castsi256_si128, _mm256_mullo_epi32,
-    _mm256_permutevar8x32_epi32, _mm256_set1_epi32, _mm256_setr_epi32, _mm256_shuffle_epi8,
-    _mm256_sub_epi32,
-};
+use core::arch::x86_64::*;
 
 use alloc::vec::Vec;
 
-use crate::{ImageBuffer, JpegColorType, rgb_to_ycbcr};
+use crate::image_buffer::{get_line, rgb_to_ycbcr_q8};
+use crate::{ImageBuffer, JpegColorType, SamplePrecision, rgb_to_ycbcr};
 
-macro_rules! ycbcr_image_avx2 {
-    ($name:ident, $num_colors:expr, $o1:expr, $o2:expr, $o3:expr) => {
-        pub struct $name<'a>(pub &'a [u8], pub u16, pub u16);
+#[inline]
+#[target_feature(enable = "avx2")]
+fn load_rgb<const N: usize, const R: usize, const G: usize, const B: usize>(
+    data: *const u8,
+) -> [__m256i; 3] {
+    // SAFETY: eight complete pixels are available. The overlapping RGB loads
+    // cover exactly bytes 0..24; RGBA uses exactly bytes 0..32.
+    let packed = unsafe {
+        if N == 3 {
+            _mm256_set_m128i(
+                _mm_loadu_si128(data.add(8).cast()),
+                _mm_loadu_si128(data.cast()),
+            )
+        } else {
+            _mm256_loadu_si256(data.cast())
+        }
+    };
+    [R, G, B].map(|c| {
+        let c = c as i8;
+        let n = N as i8;
+        let hi = if N == 3 { 4 } else { 0 } + c;
+        let mask = _mm256_setr_epi8(
+            c,
+            c + n,
+            c + 2 * n,
+            c + 3 * n,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            hi,
+            hi + n,
+            hi + 2 * n,
+            hi + 3 * n,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+        );
+        let shuffled = _mm256_shuffle_epi8(packed, mask);
+        let bytes = _mm_unpacklo_epi32(
+            _mm256_castsi256_si128(shuffled),
+            _mm256_extracti128_si256::<1>(shuffled),
+        );
+        _mm256_cvtepu8_epi32(bytes)
+    })
+}
 
-        impl<'a> $name<'a> {
-            #[target_feature(enable = "avx2")]
-            fn fill_buffers_avx2(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
-                // TODO: this compiles to many separate scalar loads and could be optimized further.
-                // But the gains are no more than 3% end to end and it doesn't seem to be worth the complexity.
-                #[inline]
-                #[target_feature(enable = "avx2")]
-                fn load3(data: &[u8]) -> __m256i {
-                    _ = data[7 * $num_colors]; // dummy indexing operation up front to avoid bounds checks later
-                    _mm256_setr_epi32(
-                        data[0] as i32,
-                        data[1 * $num_colors] as i32,
-                        data[2 * $num_colors] as i32,
-                        data[3 * $num_colors] as i32,
-                        data[4 * $num_colors] as i32,
-                        data[5 * $num_colors] as i32,
-                        data[6 * $num_colors] as i32,
-                        data[7 * $num_colors] as i32,
-                    )
-                }
+#[inline]
+#[target_feature(enable = "avx2")]
+fn convert8<const MODE: u8>([r, g, b]: [__m256i; 3]) -> [__m128i; 3] {
+    // Exact green-factored matrix: four multiplies instead of nine.
+    let rg = _mm256_sub_epi32(r, g);
+    let bg = _mm256_sub_epi32(b, g);
+    let y = _mm256_add_epi32(
+        _mm256_add_epi32(
+            _mm256_slli_epi32::<16>(g),
+            _mm256_mullo_epi32(rg, _mm256_set1_epi32(19595)),
+        ),
+        _mm256_mullo_epi32(bg, _mm256_set1_epi32(7471)),
+    );
+    let offset = _mm256_set1_epi32(128 << 16);
+    let cb = _mm256_sub_epi32(
+        _mm256_add_epi32(offset, _mm256_slli_epi32::<15>(bg)),
+        _mm256_mullo_epi32(rg, _mm256_set1_epi32(11059)),
+    );
+    let cr = _mm256_sub_epi32(
+        _mm256_add_epi32(offset, _mm256_slli_epi32::<15>(rg)),
+        _mm256_mullo_epi32(bg, _mm256_set1_epi32(5329)),
+    );
+    let narrow = |value: __m256i, fractional: bool| {
+        let value = _mm256_add_epi32(
+            value,
+            _mm256_set1_epi32(if fractional { 127 } else { 0x7fff }),
+        );
+        let value = if fractional {
+            _mm256_srli_epi32::<8>(value)
+        } else if MODE == 0 {
+            _mm256_srli_epi32::<16>(value)
+        } else {
+            _mm256_slli_epi32::<8>(_mm256_srli_epi32::<16>(value))
+        };
+        _mm_packus_epi32(
+            _mm256_castsi256_si128(value),
+            _mm256_extracti128_si256::<1>(value),
+        )
+    };
+    [
+        narrow(y, MODE != 0),
+        narrow(cb, MODE == 2),
+        narrow(cr, MODE == 2),
+    ]
+}
 
-                #[inline]
-                #[target_feature(enable = "avx2")]
-                fn avx_as_u8_array(data: __m256i) -> [u8; 8] {
-                    // Select the third byte of every i32, pack the bytes into
-                    // the low i32 byte of each 128-bit lane: idx = (4 * i) + 2
-                    let u8_shuffle_mask = _mm256_set1_epi32(i32::from_le_bytes([2, 6, 10, 14]));
-                    // Shuffle the lowest i32 lane from the high 128-bit lane
-                    // into the second i32
-                    let u32_permute_mask = _mm256_setr_epi32(0, 4, 0, 0, 0, 0, 0, 0);
-
-                    // ABCD EFGH IJKL MNOP becomes CGKO CGKO CGKO CGKO, for both lanes
-                    let a = _mm256_shuffle_epi8(data, u8_shuffle_mask);
-                    // A... B... becomes AB.. ....
-                    let a = _mm256_permutevar8x32_epi32(a, u32_permute_mask);
-
-                    // No-op cast to __m128i and extract the lower 64-bits
-                    let out = _mm256_castsi256_si128(a);
-                    _mm_cvtsi128_si64(out).to_le_bytes()
-                }
-
-                let [y_buffer, cb_buffer, cr_buffer, _] = buffers;
-                y_buffer.reserve(self.width() as usize);
-                cb_buffer.reserve(self.width() as usize);
-                cr_buffer.reserve(self.width() as usize);
-
-                let ymulr = _mm256_set1_epi32(19595);
-                let ymulg = _mm256_set1_epi32(38470);
-                let ymulb = _mm256_set1_epi32(7471);
-
-                let cbmulr = _mm256_set1_epi32(-11059);
-                let cbmulg = _mm256_set1_epi32(21709);
-                let cbmulb = _mm256_set1_epi32(32768);
-
-                let crmulr = _mm256_set1_epi32(32768);
-                let crmulg = _mm256_set1_epi32(27439);
-                let crmulb = _mm256_set1_epi32(5329);
-
-                let mut data = &self.0[(y as usize * self.1 as usize * $num_colors)..];
-
-                for _ in 0..self.width() / 8 {
-                    let r = load3(&data[$o1..]);
-                    let g = load3(&data[$o2..]);
-                    let b = load3(&data[$o3..]);
-
-                    data = &data[($num_colors * 8)..];
-
-                    let yr = _mm256_mullo_epi32(ymulr, r);
-                    let yg = _mm256_mullo_epi32(ymulg, g);
-                    let yb = _mm256_mullo_epi32(ymulb, b);
-
-                    let y = _mm256_add_epi32(_mm256_add_epi32(yr, yg), yb);
-                    let y = _mm256_add_epi32(y, _mm256_set1_epi32(0x7FFF));
-                    y_buffer.extend(avx_as_u8_array(y));
-
-                    let cbr = _mm256_mullo_epi32(cbmulr, r);
-                    let cbg = _mm256_mullo_epi32(cbmulg, g);
-                    let cbb = _mm256_mullo_epi32(cbmulb, b);
-
-                    let cb = _mm256_add_epi32(_mm256_sub_epi32(cbr, cbg), cbb);
-                    let cb = _mm256_add_epi32(cb, _mm256_set1_epi32(128 << 16));
-                    let cb = _mm256_add_epi32(cb, _mm256_set1_epi32(0x7FFF));
-                    cb_buffer.extend(avx_as_u8_array(cb));
-
-                    let crr = _mm256_mullo_epi32(crmulr, r);
-                    let crg = _mm256_mullo_epi32(crmulg, g);
-                    let crb = _mm256_mullo_epi32(crmulb, b);
-
-                    let cr = _mm256_sub_epi32(_mm256_sub_epi32(crr, crg), crb);
-                    let cr = _mm256_add_epi32(cr, _mm256_set1_epi32(128 << 16));
-                    let cr = _mm256_add_epi32(cr, _mm256_set1_epi32(0x7FFF));
-                    cr_buffer.extend(avx_as_u8_array(cr));
-                }
-
-                for _ in 0..self.width() % 8 {
-                    let (y, cb, cr) = rgb_to_ycbcr(data[$o1], data[$o2], data[$o3]);
-                    data = &data[$num_colors..];
-
-                    y_buffer.push(y);
-                    cb_buffer.push(cb);
-                    cr_buffer.push(cr);
-                }
+#[target_feature(enable = "avx2")]
+fn fill_bytes<const N: usize, const R: usize, const G: usize, const B: usize>(
+    line: &[u8],
+    buffers: &mut [Vec<u8>; 4],
+) {
+    let width = line.len() / N;
+    let [ys, cbs, crs, _] = buffers;
+    let channels = [ys, cbs, crs];
+    let starts = channels.each_ref().map(|c| c.len());
+    let mut out = channels.map(|c| {
+        c.reserve(width);
+        c
+    });
+    let mut chunks = line.chunks_exact(N * 8);
+    // SAFETY: chunks_exact bounds all input loads to this row. reserve makes
+    // width samples writable after each channel's independent current length.
+    // The lengths are advanced only after all SIMD outputs are initialized.
+    unsafe {
+        let pointers = core::array::from_fn::<_, 3, _>(|c| out[c].as_mut_ptr().add(starts[c]));
+        for (i, chunk) in (&mut chunks).enumerate() {
+            let converted = convert8::<0>(load_rgb::<N, R, G, B>(chunk.as_ptr()));
+            for c in 0..3 {
+                _mm_storel_epi64(
+                    pointers[c].add(i * 8).cast(),
+                    _mm_packus_epi16(converted[c], _mm_setzero_si128()),
+                );
             }
         }
+        let written = width / 8 * 8;
+        for (c, channel) in out.into_iter().enumerate() {
+            channel.set_len(starts[c] + written);
+        }
+    }
+    for pixel in chunks.remainder().as_chunks::<N>().0 {
+        let (y, cb, cr) = rgb_to_ycbcr(pixel[R], pixel[G], pixel[B]);
+        buffers[0].push(y);
+        buffers[1].push(cb);
+        buffers[2].push(cr);
+    }
+}
 
-        impl<'a> ImageBuffer for $name<'a> {
+#[target_feature(enable = "avx2")]
+fn fill_precise<const N: usize, const R: usize, const G: usize, const B: usize, const MODE: u8>(
+    line: &[u8],
+    buffers: &mut [Vec<u16>; 4],
+) {
+    let width = line.len() / N;
+    let [ys, cbs, crs, _] = buffers;
+    let channels = [ys, cbs, crs];
+    let starts = channels.each_ref().map(|c| c.len());
+    let mut out = channels.map(|c| {
+        c.reserve(width);
+        c
+    });
+    let mut chunks = line.chunks_exact(N * 8);
+    // SAFETY: the same row-load and reserved-capacity invariants as fill_bytes.
+    unsafe {
+        let pointers = core::array::from_fn::<_, 3, _>(|c| out[c].as_mut_ptr().add(starts[c]));
+        for (i, chunk) in (&mut chunks).enumerate() {
+            let converted = convert8::<MODE>(load_rgb::<N, R, G, B>(chunk.as_ptr()));
+            for c in 0..3 {
+                _mm_storeu_si128(pointers[c].add(i * 8).cast(), converted[c]);
+            }
+        }
+        let written = width / 8 * 8;
+        for (c, channel) in out.into_iter().enumerate() {
+            channel.set_len(starts[c] + written);
+        }
+    }
+    for pixel in chunks.remainder().as_chunks::<N>().0 {
+        let (y, cb, cr) = rgb_to_ycbcr_q8(pixel[R], pixel[G], pixel[B], MODE == 2);
+        buffers[0].push(y);
+        buffers[1].push(cb);
+        buffers[2].push(cr);
+    }
+}
+
+macro_rules! ycbcr_image_avx2 {
+    ($name:ident, $n:expr, $r:expr, $g:expr, $b:expr) => {
+        pub struct $name<'a>(pub &'a [u8], pub u16, pub u16);
+
+        impl ImageBuffer for $name<'_> {
             fn get_jpeg_color_type(&self) -> JpegColorType {
                 JpegColorType::Ycbcr
             }
-
             fn width(&self) -> u16 {
                 self.1
             }
-
             fn height(&self) -> u16 {
                 self.2
             }
+            fn supports_precise_samples(&self) -> bool {
+                true
+            }
 
-            #[inline(always)]
             fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
-                unsafe {
-                    self.fill_buffers_avx2(y, buffers);
+                let line = get_line(self.0, y, self.1, $n);
+                // SAFETY: Encoder dispatches here only after detecting AVX2.
+                unsafe { fill_bytes::<$n, $r, $g, $b>(line, buffers) }
+            }
+
+            fn fill_buffers_precise(
+                &self,
+                y: u16,
+                buffers: &mut [Vec<u16>; 4],
+                precision: SamplePrecision,
+            ) -> bool {
+                if precision == SamplePrecision::Integer {
+                    return false;
                 }
+                let line = get_line(self.0, y, self.1, $n);
+                // SAFETY: Encoder dispatches here only after detecting AVX2.
+                unsafe {
+                    match precision {
+                        SamplePrecision::All => fill_precise::<$n, $r, $g, $b, 2>(line, buffers),
+                        SamplePrecision::Luma => fill_precise::<$n, $r, $g, $b, 1>(line, buffers),
+                        SamplePrecision::Integer => unreachable!(),
+                    }
+                }
+                true
             }
         }
     };
@@ -156,82 +251,36 @@ ycbcr_image_avx2!(BgraImageAVX2, 4, 2, 1, 0);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::vec::Vec;
-
-    // A very basic linear congruential generator (LCG) to avoid external dependencies.
-    pub struct SimpleRng {
-        state: u64,
-    }
-
-    impl SimpleRng {
-        /// Create a new RNG with a given seed.
-        pub fn new(seed: u64) -> Self {
-            Self { state: seed }
-        }
-
-        /// Generate the next random u64 value.
-        pub fn next_u64(&mut self) -> u64 {
-            // Constants from Numerical Recipes
-            self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            self.state
-        }
-
-        /// Generate a random byte in 0..=255
-        pub fn next_byte(&mut self) -> u8 {
-            (self.next_u64() & 0xFF) as u8
-        }
-
-        /// Fill a Vec<u8> with random bytes of the given length.
-        pub fn random_bytes(&mut self, len: usize) -> Vec<u8> {
-            (0..len).map(|_| self.next_byte()).collect()
-        }
-    }
+    use crate::image_buffer::*;
 
     #[test]
-    #[cfg(feature = "simd")]
-    fn avx_matches_scalar_rgb() {
-        // Do not run AVX2 test on machines without it
+    fn rows_match_scalar() {
         if !std::is_x86_feature_detected!("avx2") {
+            std::eprintln!("AVX2 unavailable; skipping runtime conversion checks");
             return;
         }
-        let mut rng = SimpleRng::new(42);
-        let width = 512 + 3; // power of two plus a bit to stress remainder handling
-        let height = 1;
-        let bpp = 3;
-
-        let input = rng.random_bytes(width * height * bpp); // power of two plus a bit to exercise remainder handling
-
-        let scalar_result: Vec<[u8; 3]> = input
-            .chunks_exact(bpp)
-            .map(|chunk| {
-                let [r, g, b, ..] = chunk else { unreachable!() };
-                let (y, cb, cr) = rgb_to_ycbcr(*r, *g, *b);
-                [y, cb, cr]
-            })
-            .collect();
-
-        let mut buffers = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-        let avx_input = RgbImageAVX2(
-            &input,
-            width.try_into().unwrap(),
-            height.try_into().unwrap(),
-        );
-        // SAFETY: we've checked above that AVX2 is present
-        unsafe {
-            avx_input.fill_buffers_avx2(0, &mut buffers);
-        }
-
-        for i in 0..3 {
-            assert_eq!(buffers[i].len(), input.len() / 3);
-        }
-
-        for (i, pixel) in scalar_result.iter().copied().enumerate() {
-            let avx_pixel: [u8; 3] = [buffers[0][i], buffers[1][i], buffers[2][i]];
-            if pixel != avx_pixel {
-                panic!(
-                    "Mismatch at index {i}: scalar result is {pixel:?}, avx result is {avx_pixel:?}"
-                );
+        crate::image_buffer::tests::check_simd_rows(|rgb, rgba, width, height| {
+            let pairs: [(&dyn ImageBuffer, &dyn ImageBuffer); 4] = [
+                (
+                    &RgbImageAVX2(rgb, width, height),
+                    &RgbImage(rgb, width, height),
+                ),
+                (
+                    &RgbaImageAVX2(rgba, width, height),
+                    &RgbaImage(rgba, width, height),
+                ),
+                (
+                    &BgrImageAVX2(rgb, width, height),
+                    &BgrImage(rgb, width, height),
+                ),
+                (
+                    &BgraImageAVX2(rgba, width, height),
+                    &BgraImage(rgba, width, height),
+                ),
+            ];
+            for (simd, scalar) in pairs {
+                crate::image_buffer::tests::check_simd_image(simd, scalar);
             }
-        }
+        });
     }
 }

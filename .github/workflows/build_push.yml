@@ -1,0 +1,134 @@
+name: Build
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - 'main'
+      - '!ci_test_*'
+    tags-ignore:
+      - '*'
+  pull_request:
+    branches:
+      - 'main'
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [ "1.89.0", stable ]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+      - run: rustup target add aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu i686-unknown-linux-gnu powerpc-unknown-linux-gnu wasm32-unknown-unknown
+      - run: RUSTFLAGS="-C target-feature=+neon" cargo build --target aarch64-unknown-linux-gnu
+      - run: cargo build --target i686-unknown-linux-gnu
+      - run: cargo build --target powerpc-unknown-linux-gnu
+      - run: cargo build --target x86_64-unknown-linux-gnu
+      - run: RUSTFLAGS="-C target-feature=+avx2" cargo build --target x86_64-unknown-linux-gnu
+      - run: RUSTFLAGS="-C target-feature=+simd128" cargo build --target wasm32-unknown-unknown
+
+  rustfmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  tests_arm:
+    name: Tests ARM
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        features: ["", "--no-default-features", "--no-default-features --features sse", "--no-default-features --features avx2", "--no-default-features --features neon"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test ${{ matrix.features }}
+
+  tests_x86:
+    name: Tests x86
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["", "--no-default-features", "--no-default-features --features sse", "--no-default-features --features avx2", "--no-default-features --features neon"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test ${{ matrix.features }}
+
+  clippy_x86:
+    name: Clippy x86 Stable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo clippy -- -D warnings
+
+  clippy_x86_nightly:
+    name: Clippy x86 Nightly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: rustup component add clippy
+      - run: cargo clippy --all-features -- -D warnings
+
+  clippy_arm:
+    name: Clippy ARM
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo clippy -- -D warnings
+
+  clippy_wasm:
+    name: Clippy WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add wasm32-unknown-unknown
+      - run: rustup component add clippy
+      - run: cargo clippy --target wasm32-unknown-unknown --all-features -- -D warnings
+
+  fuzz_arm:
+    name: Fuzzing ARM
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz
+      - run: cargo fuzz run encode_rgb -- -max_total_time=12
+      - run: cargo fuzz run encode_rgb_custom_q_table -- -max_total_time=12
+      - run: cargo fuzz run encode_rgb_optimized -- -max_total_time=12
+      - run: cargo fuzz run encode_rgb_progressive -- -max_total_time=12
+      - run: cargo fuzz run encode_rgb_subsampled -- -max_total_time=12
+      - run: cargo fuzz run encode_rgb_subsampled_average -- -max_total_time=12
+      - run: cargo fuzz run encode_ycck_progressive -- -max_total_time=12
+
+  fuzz_x86_64:
+    name: Fuzzing x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz
+      - run: cargo fuzz run encode_rgb -- -max_total_time=12
+      - run: cargo fuzz run encode_rgb_custom_q_table -- -max_total_time=12
+      - run: cargo fuzz run encode_rgb_optimized -- -max_total_time=12
+      - run: cargo fuzz run encode_rgb_progressive -- -max_total_time=12
+      - run: cargo fuzz run encode_rgb_subsampled -- -max_total_time=12
+      - run: cargo fuzz run encode_rgb_subsampled_average -- -max_total_time=12
+      - run: cargo fuzz run encode_ycck_progressive -- -max_total_time=12
