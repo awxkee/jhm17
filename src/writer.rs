@@ -265,12 +265,12 @@ impl<W: JfifWrite> JfifWriter<W> {
         Ok(())
     }
 
-    /// Append a quantization table
+    /// Append quantization tables as one segment, table `i` to destination `i`
     ///
     /// - `precision`: 0 which means 1 byte per value.
-    /// - `dest`: 0 for luma or 1 for chroma tables
+    /// - `dest`: the table's index in `tables`
     ///
-    /// Layout:
+    /// Layout (the descriptor and values repeat for each table):
     /// ```txt
     /// |--------|---------------|------------------------------|--------|--------|-----|--------|
     /// | 0xFFDB | 16 bit length | 4 bit precision / 4 bit dest | V(0,0) | V(0,1) | ... | V(7,7) |
@@ -279,18 +279,19 @@ impl<W: JfifWrite> JfifWriter<W> {
     ///
     pub fn write_quantization_segment(
         &mut self,
-        destination: u8,
-        table: &QuantizationTable,
+        tables: &[QuantizationTable],
     ) -> Result<(), EncodingError> {
-        assert!(destination < 4, "Bad destination: {}", destination);
+        assert!(tables.len() <= 4, "Bad table count: {}", tables.len());
 
         self.write_marker(Marker::DQT)?;
-        self.write_u16(2 + 1 + 64)?;
+        self.write_u16(2 + 65 * tables.len() as u16)?;
 
-        self.write_u8(destination)?;
+        for (destination, table) in tables.iter().enumerate() {
+            self.write_u8(destination as u8)?;
 
-        for &v in ZIGZAG.iter() {
-            self.write_u8(table.get(v as usize))?;
+            for &v in ZIGZAG.iter() {
+                self.write_u8(table.get(v as usize))?;
+            }
         }
 
         Ok(())

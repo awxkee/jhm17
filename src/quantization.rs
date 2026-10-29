@@ -558,6 +558,11 @@ impl QuantizationTable {
         Self::from_table(table)
     }
 
+    /// Whether both tables quantize with the same steps, so one DQT entry can serve both
+    pub(crate) fn same_steps(&self, other: &QuantizationTable) -> bool {
+        self.table == other.table
+    }
+
     #[inline]
     pub fn get(&self, index: usize) -> u8 {
         (self.table[index].get() >> 3) as u8

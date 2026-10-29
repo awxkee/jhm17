@@ -701,6 +701,11 @@ impl<W: JfifWrite> Encoder<W> {
 
         let jpeg_color_type = image.get_jpeg_color_type();
         self.init_components(jpeg_color_type);
+        // Cr shares the Cb table when the tuning left them equal (e.g. 4:4:4),
+        // saving a third DQT entry.
+        if jpeg_color_type == JpegColorType::Ycbcr && q_tables[1].same_steps(&q_tables[2]) {
+            self.components[2].quantization_table = 1;
+        }
 
         self.writer.write_marker(Marker::SOI)?;
 
@@ -818,11 +823,14 @@ impl<W: JfifWrite> Encoder<W> {
             self.progressive.is_some(),
         )?;
 
-        self.writer.write_quantization_segment(0, &q_tables[0])?;
-        self.writer.write_quantization_segment(1, &q_tables[1])?;
-        if self.components.iter().any(|c| c.quantization_table == 2) {
-            self.writer.write_quantization_segment(2, &q_tables[2])?;
-        }
+        // Only the destinations some component reads (grayscale needs just luma).
+        let used = self
+            .components
+            .iter()
+            .map(|c| usize::from(c.quantization_table) + 1)
+            .max()
+            .unwrap_or(1);
+        self.writer.write_quantization_segment(&q_tables[..used])?;
 
         if let Some(restart_interval) = self.restart_interval {
             self.writer.write_dri(restart_interval)?;
