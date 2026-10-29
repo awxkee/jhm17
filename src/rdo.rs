@@ -171,6 +171,15 @@ pub(crate) fn block_activity(coefficients: &AlignedBlock) -> f32 {
         .sum()
 }
 
+/// Lowest median activity AQ measures against: a pixel standard deviation of
+/// one level (activity is `64² ·` variance).
+///
+/// Images that are mostly flat (graphics, white backgrounds) have a median
+/// near zero, which would rank every smooth gradient block as busy and raise
+/// its λ until the gradient collapses into DC-only blocks, i.e. banding.
+/// Blocks below one level of deviation mask nothing, so their λ is never raised.
+const AQ_MIN_MEDIAN_ACTIVITY: f32 = 4096.0;
+
 /// Per-block λ scales from block activities, relative to their median:
 /// `(activity / median)^(aq_strength / 2)`, clamped to `[aq_min, aq_max]`
 pub(crate) fn aq_lambda_scales(activities: &[f32], options: &RdoOptions) -> Vec<f32> {
@@ -182,7 +191,7 @@ pub(crate) fn aq_lambda_scales(activities: &[f32], options: &RdoOptions) -> Vec<
         (*selected
             .select_nth_unstable_by(middle, |a, b| a.partial_cmp(b).unwrap())
             .1)
-            .max(1.0)
+            .max(AQ_MIN_MEDIAN_ACTIVITY)
     };
     let (lo, hi) = (options.aq_min.min(options.aq_max), options.aq_max);
     // Selection no longer needs its reordered values. Refill that allocation
@@ -504,4 +513,24 @@ fn rdoq_with_coefficients(
         k = from[k] as usize;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aq_does_not_coarsen_gradients_on_flat_images() {
+        // 60% pure white blocks put the median at zero; the rest are a smooth
+        // ramp with half a level of deviation (activity 64² · 0.25).
+        let activities: Vec<f32> = (0..100)
+            .map(|i| if i < 60 { 0.0 } else { 1024.0 })
+            .collect();
+        let scales = aq_lambda_scales(&activities, &RdoOptions::default());
+        assert!(
+            scales[60..].iter().all(|&s| s <= 1.0),
+            "{:?}",
+            &scales[60..]
+        );
+    }
 }
