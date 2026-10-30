@@ -254,12 +254,15 @@ fn convert_h2v2_row(
     mut cr: impl Iterator<Item = [u8; 2]>,
     odd: bool,
 ) {
-    if odd
-        && let (Some((first, rest)), Some((&y, ys))) = (out.split_first_mut(), luma.split_first())
-    {
-        *first = colors.rgb(i32::from(y), cb.next().unwrap()[1], cr.next().unwrap()[1]);
+    if odd && !out.is_empty() && !luma.is_empty() {
+        let (first, rest) = out.split_at_mut(1);
+        first[0] = colors.rgb(
+            i32::from(luma[0]),
+            cb.next().unwrap()[1],
+            cr.next().unwrap()[1],
+        );
         out = rest;
-        luma = ys;
+        luma = &luma[1..];
     }
     let (pairs, tail) = out.as_chunks_mut::<2>();
     let (ys, ytail) = luma.as_chunks::<2>();
