@@ -24,6 +24,7 @@
 
 extern crate alloc;
 
+mod arithmetic;
 #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
 mod avx2;
 mod clip;
@@ -32,10 +33,14 @@ mod encoder;
 mod error;
 mod fdct;
 mod huffman;
+#[cfg(feature = "polish")]
+mod idct;
 mod image_buffer;
 mod marker;
 #[cfg(all(feature = "neon", target_arch = "aarch64"))]
 mod neon;
+#[cfg(feature = "polish")]
+mod polish;
 mod progressive;
 mod quantization;
 mod rdo;
@@ -48,6 +53,8 @@ pub use encoder::{
 };
 pub use error::EncodingError;
 pub use image_buffer::{ImageBuffer, cmyk_to_ycck, rgb_to_ycbcr};
+#[cfg(feature = "polish")]
+pub use polish::{Polish, PolishJudge, PolishOptions, PolishStats};
 pub use progressive::ProgressiveMode;
 pub use quantization::{Deadzone, QuantizationTableType, StepTuning};
 pub use rdo::RdoOptions;

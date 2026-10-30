@@ -6,6 +6,10 @@
 use alloc::collections::BinaryHeap;
 use alloc::vec::Vec;
 
+// A tree with 256 symbols and the reserved pseudo-symbol can have depth 256
+// before its code lengths are limited to JPEG's 16 bits.
+const MAX_CODE_SIZE: usize = 256;
+
 #[derive(Copy, Clone, Debug)]
 pub enum CodingClass {
     Dc = 0,
@@ -103,18 +107,22 @@ impl HuffmanTable {
         // Find the number of codes of each size
         // Figure K.2
 
-        let mut bits = [0u8; 33];
+        // Intermediate buckets can contain all 256 real symbols; the reserved
+        // pseudo-symbol is removed only after length limiting.
+        let mut bits = [0u16; MAX_CODE_SIZE + 1];
+        let mut max_size = 0;
 
         for &size in codesize.iter() {
             if size > 0 {
                 bits[size] += 1;
+                max_size = max_size.max(size);
             }
         }
 
         // Limiting code lengths to 16 bits
         // Figure K.3
 
-        let mut i = 32;
+        let mut i = max_size;
 
         while i > 16 {
             while bits[i] > 0 {
@@ -144,7 +152,7 @@ impl HuffmanTable {
 
         let mut length = [0u8; 16];
         for (i, v) in length.iter_mut().enumerate() {
-            *v = bits[i + 1];
+            *v = u8::try_from(bits[i + 1]).expect("too many Huffman codes of one length");
         }
 
         let values = huffval[0..k].to_vec();
@@ -223,26 +231,28 @@ fn create_lookup_table(code_length: &[u8; 16], values: &[u8]) -> [(u8, u16); 256
     lookup_table
 }
 
-/// Symbols 0..=255 ordered by code size 1..=32, ascending symbol within a size,
+/// Symbols 0..=255 ordered by code size, ascending symbol within a size,
 /// as Figure K.4's size-by-symbol double loop orders them. A counting sort
-/// visits each symbol once instead of once per size; sizes 0 and above 32 are
-/// left out, as there.
+/// visits each symbol once instead of once per size, including tree depths
+/// above 32 before length limiting. Zero sizes denote absent symbols.
 fn values_by_code_size(codesize: &[usize; 257]) -> ([u8; 256], usize) {
     // start[size] = number of symbols with a code size in 1..size
-    let mut start = [0usize; 34];
+    let mut start = [0u16; MAX_CODE_SIZE + 2];
+    let mut max_size = 0;
     for &size in &codesize[..256] {
-        if (1..=32).contains(&size) {
+        if (1..=MAX_CODE_SIZE).contains(&size) {
             start[size + 1] += 1;
+            max_size = max_size.max(size);
         }
     }
-    for size in 2..34 {
+    for size in 2..=max_size + 1 {
         start[size] += start[size - 1];
     }
-    let count = start[33];
+    let count = usize::from(start[max_size + 1]);
     let mut huffval = [0u8; 256];
     for (symbol, &size) in codesize[..256].iter().enumerate() {
-        if (1..=32).contains(&size) {
-            huffval[start[size]] = symbol as u8;
+        if (1..=MAX_CODE_SIZE).contains(&size) {
+            huffval[usize::from(start[size])] = symbol as u8;
             start[size] += 1;
         }
     }
@@ -362,7 +372,7 @@ mod tests {
     fn reference_values_by_code_size(codesize: &[usize; 257]) -> ([u8; 256], usize) {
         let mut huffval = [0u8; 256];
         let mut k = 0;
-        for i in 1..=32 {
+        for i in 1..=MAX_CODE_SIZE {
             for j in 0..=255 {
                 if codesize[j] == i {
                     huffval[k] = j as u8;
@@ -386,6 +396,8 @@ mod tests {
         check([1; 257]);
         check([32; 257]);
         check([33; 257]);
+        check([MAX_CODE_SIZE; 257]);
+        check([MAX_CODE_SIZE + 1; 257]);
         for size in 0..=40 {
             for symbol in [0, 1, 127, 254, 255, 256] {
                 let mut codesize = [0; 257];
@@ -433,6 +445,75 @@ mod tests {
             freq[256] = 1;
             check(optimized_code_sizes(&mut freq));
         }
+    }
+
+    fn check_optimized_table(freq: [u32; 257]) {
+        let table = HuffmanTable::new_optimized(freq);
+        let mut lengths = [0u16; 16];
+        let mut seen = [false; 256];
+        let mut kraft = 0u32;
+        for &symbol in table.values() {
+            let symbol = usize::from(symbol);
+            assert!(freq[symbol] > 0);
+            assert!(!seen[symbol]);
+            seen[symbol] = true;
+            let &(size, code) = table.get_for_value(symbol as u8);
+            assert!((1..=16).contains(&size));
+            assert!(u32::from(code) < (1u32 << size) - 1, "all-ones code");
+            lengths[usize::from(size) - 1] += 1;
+            kraft += 1 << (16 - size);
+        }
+        assert!(kraft < 1 << 16, "reserved code must remain unused");
+        for symbol in 0..256 {
+            assert_eq!(seen[symbol], freq[symbol] != 0, "symbol {symbol}");
+        }
+        for (actual, expected) in table.length().iter().zip(lengths) {
+            assert_eq!(u16::from(*actual), expected);
+        }
+        // Canonical codes must be prefix-free, including after redistribution.
+        for (i, &a) in table.values().iter().enumerate() {
+            for &b in &table.values()[i + 1..] {
+                let &(a_size, a_code) = table.get_for_value(a);
+                let &(b_size, b_code) = table.get_for_value(b);
+                assert!(a_size <= b_size);
+                assert_ne!(u32::from(a_code), u32::from(b_code) >> (b_size - a_size));
+            }
+        }
+    }
+
+    #[test]
+    fn length_limiting_preserves_symbols_from_trees_deeper_than_32() {
+        for count in 34..=44 {
+            let mut freq = [0u32; 257];
+            let symbols = [0, 0xf0]
+                .into_iter()
+                .chain((0..16).flat_map(|run| (1..=10).map(move |size| (run << 4) | size)));
+            let (mut a, mut b) = (1u32, 2u32);
+            for symbol in symbols.take(count) {
+                freq[symbol] = a;
+                (a, b) = (b, a + b);
+            }
+            freq[256] = 1;
+            let mut scratch = freq;
+            assert!(
+                optimized_code_sizes(&mut scratch)
+                    .into_iter()
+                    .max()
+                    .unwrap()
+                    > 32
+            );
+            check_optimized_table(freq);
+        }
+    }
+
+    #[test]
+    fn intermediate_length_buckets_can_hold_256_symbols() {
+        let mut freq = [1u32; 257];
+        freq[0] = 1_000_000;
+        let mut scratch = freq;
+        let sizes = optimized_code_sizes(&mut scratch);
+        assert_eq!(sizes.iter().filter(|&&size| size == 9).count(), 256);
+        check_optimized_table(freq);
     }
 
     #[test]

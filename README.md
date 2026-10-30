@@ -30,3 +30,7 @@ Code written for jhm17 is licensed under either of
 - Apache License, Version 2.0 (see [LICENSE](LICENSE-APACHE))
 
 at your option.
+
+This software is based in part on the work of the Independent JPEG Group;
+see [LICENSE-IJG](LICENSE-IJG) for the derived portions, including the arithmetic
+coder adapted from IJG/libjpeg-turbo.

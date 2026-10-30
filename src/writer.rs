@@ -3,6 +3,7 @@ use crate::encoder::{AlignedBlock, Component};
 use crate::huffman::{CodingClass, HuffmanTable};
 use crate::marker::{Marker, SOFType};
 use crate::quantization::QuantizationTable;
+use alloc::vec::Vec;
 
 /// Represents the pixel density of an image
 ///
@@ -92,6 +93,8 @@ pub(crate) struct JfifWriter<W: JfifWrite> {
     w: W,
     bit_buffer: usize,
     free_bits: i8,
+    // Serialized definitions by (class, destination), retained across scans.
+    huffman_definitions: [Vec<u8>; 8],
 }
 
 impl<W: JfifWrite> JfifWriter<W> {
@@ -100,6 +103,7 @@ impl<W: JfifWrite> JfifWriter<W> {
             w,
             bit_buffer: 0,
             free_bits: BUFFER_SIZE as i8,
+            huffman_definitions: core::array::from_fn(|_| Vec::new()),
         }
     }
 
@@ -235,10 +239,11 @@ impl<W: JfifWrite> JfifWriter<W> {
         self.write(&[0x00, 0x00])
     }
 
-    /// Append huffman table segment
+    /// Append a Huffman table unless this class/destination already has the
+    /// same definition. Tables remain defined across progressive scans.
     ///
     /// - `class`: 0 for DC or 1 for AC
-    /// - `dest`: 0 for luma or 1 for chroma tables
+    /// - `destination`: table destination 0..=3
     ///
     /// Layout:
     /// ```txt
@@ -255,12 +260,45 @@ impl<W: JfifWrite> JfifWriter<W> {
     ) -> Result<(), EncodingError> {
         assert!(destination < 4, "Bad destination: {}", destination);
 
-        self.write_marker(Marker::DHT)?;
-        self.write_u16(2 + 1 + 16 + table.values().len() as u16)?;
+        let previous = &self.huffman_definitions[class as usize * 4 + usize::from(destination)];
+        if previous.len() == 16 + table.values().len()
+            && previous[..16] == *table.length()
+            && previous[16..] == *table.values()
+        {
+            return Ok(());
+        }
 
-        self.write_u8(((class as u8) << 4) | destination)?;
-        self.write(table.length())?;
-        self.write(table.values())?;
+        self.write_huffman_segments(&[(class, destination, table)])
+    }
+
+    /// Append several table definitions in one DHT segment.
+    pub fn write_huffman_segments(
+        &mut self,
+        tables: &[(CodingClass, u8, &HuffmanTable)],
+    ) -> Result<(), EncodingError> {
+        if tables.is_empty() {
+            return Ok(());
+        }
+        let mut length = 2;
+        for &(_, destination, table) in tables {
+            assert!(destination < 4, "Bad destination: {}", destination);
+            length += 17 + table.values().len() as u16;
+        }
+        self.write_marker(Marker::DHT)?;
+        self.write_u16(length)?;
+
+        for &(class, destination, table) in tables {
+            self.write_u8(((class as u8) << 4) | destination)?;
+            self.write(table.length())?;
+            self.write(table.values())?;
+
+            let definition =
+                &mut self.huffman_definitions[class as usize * 4 + usize::from(destination)];
+            definition.clear();
+            definition.reserve(16 + table.values().len());
+            definition.extend_from_slice(table.length());
+            definition.extend_from_slice(table.values());
+        }
 
         Ok(())
     }
@@ -301,6 +339,17 @@ impl<W: JfifWrite> JfifWriter<W> {
         self.write_marker(Marker::DRI)?;
         self.write_u16(4)?;
         self.write_u16(restart_interval)
+    }
+
+    /// Default DC (L=0, U=1) and AC (K=5) conditioning, in one DAC segment.
+    pub fn write_arithmetic_conditioning(&mut self, tables: usize) -> Result<(), EncodingError> {
+        assert!((1..=2).contains(&tables));
+        self.write_marker(Marker::DAC)?;
+        self.write_u16(2 + 4 * tables as u16)?;
+        for table in 0..tables as u8 {
+            self.write(&[table, 0x10, 0x10 | table, 5])?;
+        }
+        Ok(())
     }
 
     #[inline]
@@ -431,13 +480,9 @@ impl<W: JfifWrite> JfifWriter<W> {
         width: u16,
         height: u16,
         components: &[Component],
-        progressive: bool,
+        frame_type: SOFType,
     ) -> Result<(), EncodingError> {
-        if progressive {
-            self.write_marker(Marker::SOF(SOFType::ProgressiveDCT))?;
-        } else {
-            self.write_marker(Marker::SOF(SOFType::BaselineDCT))?;
-        }
+        self.write_marker(Marker::SOF(frame_type))?;
 
         self.write_u16(2 + 1 + 2 + 2 + 1 + (components.len() as u16) * 3)?;
 
@@ -586,6 +631,84 @@ pub(crate) fn sparse_scan_blocks(include_min: bool) -> alloc::vec::Vec<[i16; 64]
 mod tests {
     use super::*;
     use alloc::vec::Vec;
+
+    #[test]
+    fn huffman_definitions_are_reused_only_for_the_same_class_and_destination() {
+        let first = HuffmanTable::new(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[0]);
+        let different_value =
+            HuffmanTable::new(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[1]);
+        let different_length =
+            HuffmanTable::new(&[0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[0]);
+        let mut writer = JfifWriter::new(Vec::new());
+        writer
+            .write_huffman_segments(&[(CodingClass::Dc, 0, &first), (CodingClass::Ac, 0, &first)])
+            .unwrap();
+        let combined_length = writer.w.len();
+        assert_eq!(combined_length, 4 + 2 * 18);
+        assert_eq!(&writer.w[..4], &[255, 196, 0, 38]);
+        writer
+            .write_huffman_segment(CodingClass::Dc, 0, &first)
+            .unwrap();
+        writer
+            .write_huffman_segment(CodingClass::Ac, 0, &first)
+            .unwrap();
+        assert_eq!(writer.w.len(), combined_length);
+
+        // Equal contents at another destination still need a definition.
+        writer
+            .write_huffman_segment(CodingClass::Dc, 1, &first)
+            .unwrap();
+        assert_eq!(writer.w.len(), combined_length + 22);
+        writer
+            .write_huffman_segment(CodingClass::Dc, 0, &different_value)
+            .unwrap();
+        writer
+            .write_huffman_segment(CodingClass::Dc, 0, &different_length)
+            .unwrap();
+        // Reverting to an older table must redefine it, even if seen before.
+        writer
+            .write_huffman_segment(CodingClass::Dc, 0, &first)
+            .unwrap();
+        assert_eq!(writer.w.len(), combined_length + 4 * 22);
+    }
+
+    #[test]
+    fn failed_huffman_definitions_are_not_cached() {
+        struct FailOnce {
+            call: usize,
+            fail_at: usize,
+            bytes: Vec<u8>,
+        }
+        impl JfifWrite for FailOnce {
+            fn write_all(&mut self, bytes: &[u8]) -> Result<(), EncodingError> {
+                self.call += 1;
+                if self.call == self.fail_at {
+                    return Err(EncodingError::Write("injected failure".into()));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(())
+            }
+        }
+        let table = HuffmanTable::default_luma_dc();
+        for fail_at in 1..=5 {
+            let mut writer = JfifWriter::new(FailOnce {
+                call: 0,
+                fail_at,
+                bytes: Vec::new(),
+            });
+            assert!(
+                writer
+                    .write_huffman_segment(CodingClass::Dc, 0, &table)
+                    .is_err()
+            );
+            writer.w.bytes.clear();
+            writer
+                .write_huffman_segment(CodingClass::Dc, 0, &table)
+                .unwrap();
+            assert_eq!(&writer.w.bytes[..2], &[255, 196]);
+            assert_eq!(writer.w.bytes.len(), 21 + table.values().len());
+        }
+    }
 
     #[test]
     fn nonzero_mask_matches_per_coefficient_bits() {

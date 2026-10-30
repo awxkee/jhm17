@@ -9,6 +9,10 @@ crate publishes the missing license file upstream.
 
 The IJG-derived portions include, at least:
 
+- src/arithmetic.rs, ported and adapted from IJG/libjpeg-turbo's jcarith.c and
+  jaricom.c. The Rust implementation uses indexed statistics bins, jhm17's
+  block orders and scan scripts, and fallible output rather than the original
+  C compressor structures and destination manager.
 - src/fdct.rs, which is ported from mozjpeg to Rust and states that it was part
   of the Independent JPEG Group's software.
 - src/avx2/fdct.rs, which is ported from mozjpeg / jfdctint-avx2.asm to Rust

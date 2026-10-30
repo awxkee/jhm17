@@ -927,7 +927,7 @@ fn count_eob_runs(masks: &[u64], scan: &Scan, interval: usize) -> [u32; 15] {
 }
 
 /// Scripts (per component) that the optimizer chooses between
-fn candidate_scripts(luma: bool) -> Vec<Vec<Scan>> {
+pub(crate) fn candidate_scripts(luma: bool) -> Vec<Vec<Scan>> {
     let partitions: &[&[(u8, u8)]] = if luma {
         &[
             &[(1, 63)],
@@ -969,7 +969,7 @@ fn candidate_scripts(luma: bool) -> Vec<Vec<Scan>> {
 }
 
 /// Spectral selection only: a DC scan and `scans - 1` equal AC bands
-fn spectral_script(scans: u8) -> Vec<Scan> {
+pub(crate) fn spectral_script(scans: u8) -> Vec<Scan> {
     let bands = (scans.clamp(2, 64) - 1) as usize;
     let per_band = 63 / bands;
     let mut script = alloc::vec![Scan::dc(0, 0)];
@@ -987,7 +987,7 @@ fn spectral_script(scans: u8) -> Vec<Scan> {
 }
 
 /// libjpeg's `jpeg_simple_progression` for one component
-fn standard_script(luma: bool) -> Vec<Scan> {
+pub(crate) fn standard_script(luma: bool) -> Vec<Scan> {
     if luma {
         alloc::vec![
             Scan::dc(0, 1),

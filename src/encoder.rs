@@ -1,7 +1,7 @@
 use crate::dct_f32::Transforms;
 use crate::huffman::{CodingClass, HuffmanTable};
 use crate::image_buffer::*;
-use crate::marker::Marker;
+use crate::marker::{Marker, SOFType};
 use crate::progressive::{self, ProgressiveMode};
 use crate::quantization::{Deadzone, QuantizationTable, QuantizationTableType, StepTuning};
 use crate::rdo::{
@@ -298,6 +298,7 @@ pub struct Encoder<W: JfifWrite> {
     restart_interval: Option<u16>,
 
     optimize_huffman_table: bool,
+    arithmetic_coding: bool,
 
     rdo: Option<RdoOptions>,
 
@@ -309,6 +310,14 @@ pub struct Encoder<W: JfifWrite> {
     auto_chroma_scale: bool,
 
     app_segments: Vec<(u8, Vec<u8>)>,
+
+    #[cfg(feature = "polish")]
+    polish: crate::polish::Polish,
+    /// RGB source the polish judges against, captured by [encode](Encoder::encode)
+    #[cfg(feature = "polish")]
+    polish_source: Option<Vec<u8>>,
+    #[cfg(feature = "polish")]
+    polish_stats: Option<std::sync::Arc<std::sync::Mutex<Option<crate::polish::PolishStats>>>>,
 }
 
 impl<W: JfifWrite> Encoder<W> {
@@ -358,6 +367,7 @@ impl<W: JfifWrite> Encoder<W> {
             progressive: None,
             restart_interval: None,
             optimize_huffman_table: true,
+            arithmetic_coding: false,
             rdo: Some(RdoOptions::default()),
             step_tuning: [
                 StepTuning {
@@ -370,6 +380,12 @@ impl<W: JfifWrite> Encoder<W> {
             deadzone: Deadzone::default(),
             auto_chroma_scale: true,
             app_segments: Vec::new(),
+            #[cfg(feature = "polish")]
+            polish: crate::polish::Polish::Off,
+            #[cfg(feature = "polish")]
+            polish_source: None,
+            #[cfg(feature = "polish")]
+            polish_stats: None,
         }
     }
 
@@ -503,6 +519,7 @@ impl<W: JfifWrite> Encoder<W> {
     /// Set if optimized huffman table should be created
     ///
     /// Optimized tables result in slightly smaller file sizes but decrease encoding performance.
+    /// Ignored for arithmetic-coded output.
     pub fn set_optimized_huffman_tables(&mut self, optimize_huffman_table: bool) {
         self.optimize_huffman_table = optimize_huffman_table;
     }
@@ -510,6 +527,21 @@ impl<W: JfifWrite> Encoder<W> {
     /// Returns if optimized huffman table should be generated
     pub fn optimized_huffman_tables(&self) -> bool {
         self.optimize_huffman_table
+    }
+
+    /// Enable JPEG arithmetic entropy coding (off by default).
+    ///
+    /// Supports sequential and progressive scans, including restart markers.
+    /// The decoder must support arithmetic JPEG (SOF9/SOF10), which is less
+    /// widely supported than Huffman JPEG. Quantization is unchanged; RDO and
+    /// coefficient polish retain their Huffman-based rate estimates.
+    pub fn set_arithmetic_coding(&mut self, arithmetic: bool) {
+        self.arithmetic_coding = arithmetic;
+    }
+
+    /// Return whether JPEG arithmetic entropy coding is enabled.
+    pub fn arithmetic_coding(&self) -> bool {
+        self.arithmetic_coding
     }
 
     /// Enable rate-distortion optimized quantization
@@ -621,7 +653,7 @@ impl<W: JfifWrite> Encoder<W> {
     ///
     /// Data format and length must conform to specified width, height and color type.
     pub fn encode(
-        self,
+        #[allow(unused_mut)] mut self,
         data: &[u8],
         width: u16,
         height: u16,
@@ -634,6 +666,11 @@ impl<W: JfifWrite> Encoder<W> {
                 length: data.len(),
                 required: required_data_len,
             });
+        }
+
+        #[cfg(feature = "polish")]
+        if self.polish != crate::polish::Polish::Off && color_type == ColorType::Rgb {
+            self.polish_source = Some(data[..required_data_len].to_vec());
         }
 
         match color_type {
@@ -649,6 +686,32 @@ impl<W: JfifWrite> Encoder<W> {
         }
     }
 
+    /// Set the decoder-feedback coefficient polish (RGB input with 4:4:4 or
+    /// 4:2:0 sampling; other inputs encode without it).
+    ///
+    /// When polishing, prefer [Polish::TrellisGreedy](crate::Polish::TrellisGreedy),
+    /// and keep the trellis quantizer ([set_rdo](Self::set_rdo), on by
+    /// default): polish refines the trellis' levels.
+    #[cfg(feature = "polish")]
+    pub fn set_polish(&mut self, polish: crate::polish::Polish) {
+        self.polish = polish;
+    }
+
+    /// Returns the coefficient polish mode
+    #[cfg(feature = "polish")]
+    pub fn polish(&self) -> crate::polish::Polish {
+        self.polish
+    }
+
+    /// Receive the statistics of the polish pass once the image is encoded
+    #[cfg(feature = "polish")]
+    pub fn set_polish_stats_sink(
+        &mut self,
+        sink: std::sync::Arc<std::sync::Mutex<Option<crate::polish::PolishStats>>>,
+    ) {
+        self.polish_stats = Some(sink);
+    }
+
     /// Encode an image
     pub fn encode_image<I: ImageBuffer>(mut self, image: I) -> Result<(), EncodingError> {
         if image.width() == 0 || image.height() == 0 {
@@ -658,46 +721,7 @@ impl<W: JfifWrite> Encoder<W> {
             });
         }
 
-        let mut chroma_tuning = [self.step_tuning[1], self.step_tuning[2]];
-        if image.get_jpeg_color_type().get_num_components() >= 3
-            && self.sampling_factor.get_sampling_factors() == (1, 1)
-        {
-            for t in &mut chroma_tuning {
-                t.ac *= FULL_RESOLUTION_CHROMA_SCALE;
-                t.dc *= FULL_RESOLUTION_CHROMA_DC_SCALE;
-            }
-        } else if image.get_jpeg_color_type() == JpegColorType::Ycbcr {
-            chroma_tuning[0].ac *= SUBSAMPLED_CB_SCALE;
-        }
-        if self.auto_chroma_scale
-            && image.get_jpeg_color_type() == JpegColorType::Ycbcr
-            && saturated_red(&image)
-        {
-            for t in &mut chroma_tuning {
-                t.ac *= SATURATED_RED_CHROMA_SCALE;
-            }
-        }
-
-        let q_tables = [
-            QuantizationTable::new_with_quality_tuned(
-                &self.quantization_tables[0],
-                self.quality,
-                true,
-                &self.step_tuning[0],
-            ),
-            QuantizationTable::new_with_quality_tuned(
-                &self.quantization_tables[1],
-                self.quality,
-                false,
-                &chroma_tuning[0],
-            ),
-            QuantizationTable::new_with_quality_tuned(
-                &self.quantization_tables[1],
-                self.quality,
-                false,
-                &chroma_tuning[1],
-            ),
-        ];
+        let q_tables = self.quality_tables(self.quality, &image);
 
         let jpeg_color_type = image.get_jpeg_color_type();
         self.init_components(jpeg_color_type);
@@ -729,7 +753,8 @@ impl<W: JfifWrite> Encoder<W> {
 
         if let Some(mode) = self.progressive {
             self.encode_image_progressive_scripted(image, mode, &q_tables)?;
-        } else if self.optimize_huffman_table
+        } else if self.arithmetic_coding
+            || self.optimize_huffman_table
             || self.rdo.is_some()
             || !self.sampling_factor.supports_interleaved()
             || (self.sample_precision != SamplePrecision::Integer
@@ -743,6 +768,138 @@ impl<W: JfifWrite> Encoder<W> {
         self.writer.write_marker(Marker::EOI)?;
 
         Ok(())
+    }
+
+    /// Quantization tables of Y, Cb and Cr for `quality`
+    fn quality_tables<I: ImageBuffer>(&self, quality: u8, image: &I) -> [QuantizationTable; 3] {
+        let mut chroma_tuning = [self.step_tuning[1], self.step_tuning[2]];
+        if image.get_jpeg_color_type().get_num_components() >= 3
+            && self.sampling_factor.get_sampling_factors() == (1, 1)
+        {
+            for t in &mut chroma_tuning {
+                t.ac *= FULL_RESOLUTION_CHROMA_SCALE;
+                t.dc *= FULL_RESOLUTION_CHROMA_DC_SCALE;
+            }
+        } else if image.get_jpeg_color_type() == JpegColorType::Ycbcr {
+            chroma_tuning[0].ac *= SUBSAMPLED_CB_SCALE;
+        }
+        if self.auto_chroma_scale
+            && image.get_jpeg_color_type() == JpegColorType::Ycbcr
+            && saturated_red(image)
+        {
+            for t in &mut chroma_tuning {
+                t.ac *= SATURATED_RED_CHROMA_SCALE;
+            }
+        }
+
+        [
+            QuantizationTable::new_with_quality_tuned(
+                &self.quantization_tables[0],
+                quality,
+                true,
+                &self.step_tuning[0],
+            ),
+            QuantizationTable::new_with_quality_tuned(
+                &self.quantization_tables[1],
+                quality,
+                false,
+                &chroma_tuning[0],
+            ),
+            QuantizationTable::new_with_quality_tuned(
+                &self.quantization_tables[1],
+                quality,
+                false,
+                &chroma_tuning[1],
+            ),
+        ]
+    }
+
+    /// Whether [polish_blocks](Self::polish_blocks) will run on this image
+    fn polish_active(&self) -> bool {
+        #[cfg(feature = "polish")]
+        {
+            self.polish.options().is_some()
+                && self.polish_source.is_some()
+                && self.components.len() == 3
+                && matches!(self.sampling_factor.get_sampling_factors(), (1, 1) | (2, 2))
+        }
+        #[cfg(not(feature = "polish"))]
+        {
+            false
+        }
+    }
+
+    /// Decoder-feedback polish of the quantized blocks (see `polish.rs`)
+    #[cfg(feature = "polish")]
+    fn polish_blocks<I: ImageBuffer>(
+        &mut self,
+        image: &I,
+        q_tables: &[QuantizationTable; 3],
+        blocks: &mut [Vec<AlignedBlock>; 4],
+        grids: &[BlockGrid; 4],
+    ) {
+        use crate::polish::{PlaneSpec, Polisher};
+        let options = self.polish.options().unwrap();
+        let source = self.polish_source.take().unwrap();
+        let (max_h, _) = self.get_max_sampling_size();
+        let specs: Vec<PlaneSpec> = self
+            .components
+            .iter()
+            .enumerate()
+            .map(|(i, c)| PlaneSpec {
+                padded_cols: grids[i].padded_cols,
+                padded_rows: grids[i].padded_rows,
+                sub: max_h / usize::from(c.horizontal_sampling_factor),
+                ac_table: usize::from(c.ac_huffman_table),
+                dc_table: usize::from(c.dc_huffman_table),
+            })
+            .collect();
+        let selectors: Vec<usize> = self
+            .components
+            .iter()
+            .map(|c| usize::from(c.quantization_table))
+            .collect();
+        let dqt = |tables: &[QuantizationTable; 3]| -> Vec<[u16; 64]> {
+            selectors
+                .iter()
+                .map(|&t| core::array::from_fn(|z| u16::from(tables[t].get(z))))
+                .collect()
+        };
+        let Some(polisher) = Polisher::new(
+            &source,
+            usize::from(image.width()),
+            usize::from(image.height()),
+            specs,
+            options,
+        ) else {
+            return;
+        };
+        // Exchange rates from two encodes at neighbouring qualities
+        let lo = self.quality.saturating_sub(options.quality_step).max(1);
+        let hi = self.quality.saturating_add(options.quality_step).min(100);
+        if lo == hi {
+            return;
+        }
+        let mut points = Vec::new();
+        for q in [lo, hi] {
+            let tables = self.quality_tables(q, image);
+            let (b, _) = self.encode_blocks(image, &tables, None);
+            points.push(polisher.measure(&b[..self.components.len()], &dqt(&tables)));
+        }
+        let span = (points[1].0 as f64 / points[0].0.max(1) as f64).ln();
+        let slope = |a: f64, b: f64| {
+            let s = (b - a) / span;
+            if s.is_finite() && s > 1e-6 { s } else { 1e-6 }
+        };
+        let slopes = (
+            slope(points[0].1, points[1].1),
+            slope(points[0].2, points[1].2),
+        );
+        let n = self.components.len();
+        let stats = polisher.polish(&mut blocks[..n], &dqt(q_tables), slopes);
+        if let Some(sink) = &self.polish_stats {
+            *sink.lock().unwrap() = Some(stats);
+        }
     }
 
     fn init_components(&mut self, color: JpegColorType) {
@@ -816,11 +973,17 @@ impl<W: JfifWrite> Encoder<W> {
         image: &I,
         q_tables: &[QuantizationTable; 3],
     ) -> Result<(), EncodingError> {
+        let frame_type = match (self.arithmetic_coding, self.progressive.is_some()) {
+            (false, false) => SOFType::BaselineDCT,
+            (false, true) => SOFType::ProgressiveDCT,
+            (true, false) => SOFType::ExtendedSequentialDCTArithmetic,
+            (true, true) => SOFType::ProgressiveDCTArithmetic,
+        };
         self.writer.write_frame_header(
             image.width(),
             image.height(),
             &self.components,
-            self.progressive.is_some(),
+            frame_type,
         )?;
 
         // Only the destinations some component reads (grayscale needs just luma).
@@ -836,23 +999,27 @@ impl<W: JfifWrite> Encoder<W> {
             self.writer.write_dri(restart_interval)?;
         }
 
+        if self.arithmetic_coding {
+            return self
+                .writer
+                .write_arithmetic_conditioning(self.components.len().min(2));
+        }
+
         if self.progressive.is_some() {
-            // Every progressive scan brings its own Huffman table.
+            // Progressive scans define their Huffman tables as needed.
             return Ok(());
         }
 
-        self.writer
-            .write_huffman_segment(CodingClass::Dc, 0, &self.huffman_tables[0].0)?;
-
-        self.writer
-            .write_huffman_segment(CodingClass::Ac, 0, &self.huffman_tables[0].1)?;
-
+        let tables = [
+            (CodingClass::Dc, 0, &self.huffman_tables[0].0),
+            (CodingClass::Ac, 0, &self.huffman_tables[0].1),
+            (CodingClass::Dc, 1, &self.huffman_tables[1].0),
+            (CodingClass::Ac, 1, &self.huffman_tables[1].1),
+        ];
         if image.get_jpeg_color_type().get_num_components() >= 3 {
-            self.writer
-                .write_huffman_segment(CodingClass::Dc, 1, &self.huffman_tables[1].0)?;
-
-            self.writer
-                .write_huffman_segment(CodingClass::Ac, 1, &self.huffman_tables[1].1)?;
+            self.writer.write_huffman_segments(&tables)?;
+        } else {
+            self.writer.write_huffman_segments(&tables[..2])?;
         }
 
         Ok(())
@@ -866,7 +1033,12 @@ impl<W: JfifWrite> Encoder<W> {
         mode: ProgressiveMode,
         q_tables: &[QuantizationTable; 3],
     ) -> Result<(), EncodingError> {
-        let (blocks, grids) = self.encode_blocks(&image, q_tables, None);
+        #[allow(unused_mut)]
+        let (mut blocks, grids) = self.encode_blocks(&image, q_tables, None);
+        #[cfg(feature = "polish")]
+        if self.polish_active() {
+            self.polish_blocks(&image, q_tables, &mut blocks, &grids);
+        }
         let used = self.components.len();
         let blocks: Vec<Vec<AlignedBlock>> = blocks
             .into_iter()
@@ -880,9 +1052,22 @@ impl<W: JfifWrite> Encoder<W> {
             .map(|c| c.quantization_table == 0)
             .collect();
         let restart_interval = self.restart_interval.unwrap_or(0) as usize;
-        let scripts = progressive::choose_scripts(&blocks, &luma, restart_interval, mode);
+        let scripts = if self.arithmetic_coding {
+            crate::arithmetic::choose_scripts(&blocks, &self.components, restart_interval, mode)
+        } else {
+            progressive::choose_scripts(&blocks, &luma, restart_interval, mode)
+        };
 
         self.write_frame_header(&image, q_tables)?;
+        if self.arithmetic_coding {
+            return crate::arithmetic::write_scripts(
+                &mut self.writer,
+                &blocks,
+                &scripts,
+                &self.components,
+                restart_interval,
+            );
+        }
         progressive::write_scripts(
             &mut self.writer,
             &blocks,
@@ -1053,16 +1238,34 @@ impl<W: JfifWrite> Encoder<W> {
         for freq in &mut final_ac {
             freq[256] = 1;
         }
-        let count_ac = self.rdo.is_some();
-        let (blocks, grids) =
+        let polish = self.polish_active();
+        let count_ac = self.rdo.is_some() && !polish && !self.arithmetic_coding;
+        #[allow(unused_mut)]
+        let (mut blocks, grids) =
             self.encode_blocks(&image, q_tables, count_ac.then_some(&mut final_ac));
+        #[cfg(feature = "polish")]
+        if polish {
+            self.polish_blocks(&image, q_tables, &mut blocks, &grids);
+        }
         let orders = self.coding_orders(&grids);
 
-        if self.optimize_huffman_table || self.rdo.is_some() {
+        if !self.arithmetic_coding && (self.optimize_huffman_table || self.rdo.is_some() || polish)
+        {
             self.optimize_huffman_table(&blocks, &orders, count_ac.then_some(&final_ac));
         }
 
         self.write_frame_header(&image, q_tables)?;
+
+        if self.arithmetic_coding {
+            return crate::arithmetic::write_sequential(
+                &mut self.writer,
+                &blocks,
+                &orders,
+                &self.components,
+                self.restart_interval.unwrap_or(0) as usize,
+                self.sampling_factor.supports_interleaved(),
+            );
+        }
 
         if self.sampling_factor.supports_interleaved() {
             return self.write_interleaved_scan(&blocks, &orders);
@@ -2605,6 +2808,104 @@ mod dispatch_tests {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "polish"))]
+mod polish_tests {
+    use crate::{ColorType, Encoder, Polish, PolishOptions, RdoOptions, SamplingFactor};
+    use alloc::vec::Vec;
+
+    fn image() -> (Vec<u8>, u16, u16) {
+        let (w, h) = (64u16, 48u16);
+        let mut data = Vec::new();
+        for y in 0..h as u32 {
+            for x in 0..w as u32 {
+                let ripple = ((x * 13 + y * 7) % 17) as u8 * 5;
+                data.extend_from_slice(&[
+                    (x * 4) as u8 ^ ripple,
+                    (y * 5) as u8,
+                    (x * y % 200) as u8 + ripple / 2,
+                ]);
+            }
+        }
+        (data, w, h)
+    }
+
+    fn encode(polish: Option<Polish>, sampling: SamplingFactor, color: ColorType) -> Vec<u8> {
+        let (data, w, h) = image();
+        let data = if color == ColorType::Luma {
+            data.as_chunks::<3>().0.iter().map(|p| p[1]).collect()
+        } else {
+            data
+        };
+        let mut out = Vec::new();
+        let mut e = Encoder::new(&mut out, 60);
+        e.set_sampling_factor(sampling);
+        e.set_optimized_huffman_tables(true);
+        e.set_rdo(Some(RdoOptions::default()));
+        if let Some(polish) = polish {
+            e.set_polish(polish);
+            assert_eq!(e.polish(), polish);
+        }
+        e.encode(&data, w, h, color).unwrap();
+        out
+    }
+
+    #[test]
+    fn off_is_the_default_and_changes_nothing() {
+        let plain = encode(None, SamplingFactor::F_2_2, ColorType::Rgb);
+        assert_eq!(
+            encode(Some(Polish::Off), SamplingFactor::F_2_2, ColorType::Rgb),
+            plain
+        );
+        assert_eq!(Polish::default(), Polish::Off);
+        assert_eq!(Polish::Off.options(), None);
+    }
+
+    #[test]
+    fn modes_select_their_options() {
+        let greedy = Polish::Greedy.options().unwrap();
+        assert_eq!(greedy, PolishOptions::default());
+        assert_eq!(greedy.trellis_k, 0);
+        let trellis = Polish::Trellis.options().unwrap();
+        assert!(trellis.trellis_k > 0 && trellis.rounds == 0);
+        let both = Polish::TrellisGreedy.options().unwrap();
+        assert!(both.trellis_k > 0 && both.rounds == greedy.rounds);
+        let custom = PolishOptions {
+            proposals: 2,
+            ..PolishOptions::default()
+        };
+        assert_eq!(Polish::Custom(custom).options(), Some(custom));
+    }
+
+    #[test]
+    fn modes_change_the_stream_and_decode() {
+        let plain = encode(None, SamplingFactor::F_2_2, ColorType::Rgb);
+        for polish in [Polish::Greedy, Polish::Trellis, Polish::TrellisGreedy] {
+            for sampling in [SamplingFactor::F_2_2, SamplingFactor::F_1_1] {
+                let polished = encode(Some(polish), sampling, ColorType::Rgb);
+                if sampling == SamplingFactor::F_2_2 {
+                    assert_ne!(polished, plain, "{polish:?} left the stream unchanged");
+                }
+                let mut d = jpeg_decoder::Decoder::new(polished.as_slice());
+                d.decode().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_inputs_encode_without_polish() {
+        for (sampling, color) in [
+            (SamplingFactor::F_2_1, ColorType::Rgb),
+            (SamplingFactor::F_2_2, ColorType::Luma),
+        ] {
+            assert_eq!(
+                encode(Some(Polish::TrellisGreedy), sampling, color),
+                encode(None, sampling, color),
+                "{sampling:?} {color:?}"
+            );
         }
     }
 }
