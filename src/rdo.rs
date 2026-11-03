@@ -378,60 +378,109 @@ fn rdoq_with_coefficients(
 ) -> AlignedBlock {
     let lambda = options.lambda * lambda_scale;
 
-    // Ideal (unrounded) levels in zigzag order; DC is coded by the plain quantizer.
+    // Ideal (unrounded) levels; DC is coded by the plain quantizer. Divide in
+    // natural order so the loop vectorizes, then gather into zigzag order.
+    let mut natural = [0f32; 64];
+    for (z, v) in natural.iter_mut().enumerate().skip(1) {
+        *v = coefficient(z) / table.step(z);
+    }
     let mut ideal = [0f32; 64];
     for (k, &z) in ZIGZAG.iter().enumerate().skip(1) {
-        ideal[k] = coefficient(z as usize) / table.step(z as usize);
+        ideal[k] = natural[z as usize];
     }
 
-    // prefix[k] = weighted squared error of zeroing positions 1..=k
+    // prefix[k] = weighted squared error of zeroing positions 1..=k, and the
+    // positions whose rounded level is nonzero (the only ones that open a state)
     let mut prefix = [0f32; 64];
+    let mut nonzero = 0u64;
     for k in 1..64 {
         prefix[k] = prefix[k - 1] + weights[k] * ideal[k] * ideal[k];
+        nonzero |= u64::from((ideal[k].abs() + 0.5) as i32 != 0) << k;
     }
 
+    // A completed state never changes. Keep its prefix, cost and traceback
+    // beside its position; `from` indexes the predecessor state.
+    // State zero represents a path with no nonzero AC coefficients yet.
     #[derive(Clone, Copy)]
     struct State {
         position: u8,
+        from: u8,
+        level: i16,
         prefix: f32,
         cost: f32,
     }
-    let mut from = [0u8; 64];
-    let mut level = [0i32; 64];
-    // A completed predecessor never changes. Keep its prefix and cost beside
-    // its position to avoid two indexed array lookups in every trellis edge.
-    // State zero represents a path with no nonzero AC coefficients yet.
     let mut reachable = [State {
         position: 0,
+        from: 0,
+        level: 0,
         prefix: 0.0,
         cost: 0.0,
     }; 64];
     let mut reachable_len = 1;
 
-    for k in 1..64 {
+    let mut remaining = nonzero;
+    while remaining != 0 {
+        let k = remaining.trailing_zeros() as usize;
+        remaining &= remaining - 1;
         let x = ideal[k];
         let ax = x.abs();
         let rounded = (ax + 0.5) as i32;
-        if rounded == 0 {
-            continue;
-        }
-        let candidates = [rounded, rounded - 1];
         // Within one size category the rate and future state are identical,
         // and rounding minimizes squared error. A lower level can help only
         // when it crosses a category boundary (2, 4, 8, ...).
-        let count = if rounded >= 2 && (rounded as u32).is_power_of_two() {
-            2
-        } else {
-            1
-        };
+        let size = size_of(rounded);
+        let d = ax - rounded as f32;
+        let distortion = weights[k] * d * d;
+        let zeros = prefix[k - 1];
         let mut best = f32::INFINITY;
-
-        for &l in &candidates[..count] {
-            let size = size_of(l);
-            let d = ax - l as f32;
-            let distortion = weights[k] * d * d;
-            for predecessor in reachable[..reachable_len].iter().rev() {
-                let tail = prefix[k - 1] - predecessor.prefix;
+        let mut best_from = 0;
+        let mut l = rounded;
+        if rounded >= 2 && (rounded as u32).is_power_of_two() {
+            // Both candidates in one pass over the predecessors. The lower level
+            // keeps its own best and wins only when strictly cheaper, matching
+            // two sequential passes; its bound also includes the rounded best.
+            let lower = rounded - 1;
+            let lower_size = size - 1;
+            let dl = ax - lower as f32;
+            let lower_distortion = weights[k] * dl * dl;
+            let mut lower_best = f32::INFINITY;
+            let mut lower_from = 0;
+            for (i, predecessor) in reachable[..reachable_len].iter().enumerate().rev() {
+                let tail = zeros - predecessor.prefix;
+                let keep_rounded = tail + distortion < best;
+                let keep_lower = tail + lower_distortion < best.min(lower_best);
+                if !keep_rounded && !keep_lower {
+                    // Every earlier predecessor zeroes at least this much; no cheaper path remains.
+                    break;
+                }
+                let run = k - usize::from(predecessor.position) - 1;
+                if keep_rounded {
+                    let cost =
+                        predecessor.cost + tail + distortion + lambda * prices.nonzero(run, size);
+                    if cost < best {
+                        best = cost;
+                        best_from = i;
+                    }
+                }
+                if keep_lower {
+                    let cost = predecessor.cost
+                        + tail
+                        + lower_distortion
+                        + lambda * prices.nonzero(run, lower_size);
+                    if cost < lower_best {
+                        lower_best = cost;
+                        lower_from = i;
+                    }
+                }
+            }
+            if lower_best < best {
+                best = lower_best;
+                best_from = lower_from;
+                l = lower;
+            }
+        } else {
+            for (i, predecessor) in reachable[..reachable_len].iter().enumerate().rev() {
+                let tail = zeros - predecessor.prefix;
                 if tail + distortion >= best {
                     // Every earlier predecessor zeroes at least this much; no cheaper path remains.
                     break;
@@ -441,13 +490,14 @@ fn rdoq_with_coefficients(
                     predecessor.cost + tail + distortion + lambda * prices.nonzero(run, size);
                 if cost < best {
                     best = cost;
-                    from[k] = predecessor.position;
-                    level[k] = if x < 0.0 { -l } else { l };
+                    best_from = i;
                 }
             }
         }
         reachable[reachable_len] = State {
             position: k as u8,
+            from: best_from as u8,
+            level: (if x < 0.0 { -l } else { l }) as i16,
             prefix: prefix[k],
             cost: best,
         };
@@ -457,7 +507,7 @@ fn rdoq_with_coefficients(
     // Close the block: zeros after the last nonzero plus an EOB unless it sits at 63.
     let mut end = 0;
     let mut end_cost = f32::INFINITY;
-    for state in &reachable[..reachable_len] {
+    for (i, state) in reachable[..reachable_len].iter().enumerate() {
         if state.cost == f32::INFINITY {
             continue;
         }
@@ -470,21 +520,23 @@ fn rdoq_with_coefficients(
         let cost = state.cost + tail + eob;
         if cost < end_cost {
             end_cost = cost;
-            end = usize::from(state.position);
+            end = i;
         }
     }
 
     let mut out = AlignedBlock::default();
     out.data[0] = dc;
-    let mut k = end;
+    let mut i = end;
     if let Some(freq) = final_ac {
         // Count each selected nonzero's run after finding its predecessor.
         // Histogram additions commute, so traceback can visit them backwards.
         // Use emitted i16 values, including wrapped levels for extreme inputs.
         let mut next = 64;
         let mut next_size = 0;
-        while k > 0 {
-            let value = level[k] as i16;
+        while i > 0 {
+            let state = reachable[i];
+            let k = usize::from(state.position);
+            let value = state.level;
             out.data[k] = value;
             if value != 0 {
                 if next < 64 {
@@ -497,7 +549,7 @@ fn rdoq_with_coefficients(
                 next = k;
                 next_size = size_of(i32::from(value.unsigned_abs() & 0x7fff)) as usize;
             }
-            k = from[k] as usize;
+            i = usize::from(state.from);
         }
         if next < 64 {
             let run = next - 1;
@@ -508,9 +560,10 @@ fn rdoq_with_coefficients(
         }
         return out;
     }
-    while k > 0 {
-        out.data[k] = level[k] as i16;
-        k = from[k] as usize;
+    while i > 0 {
+        let state = reachable[i];
+        out.data[usize::from(state.position)] = state.level;
+        i = usize::from(state.from);
     }
     out
 }
