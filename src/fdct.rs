@@ -141,9 +141,6 @@ macro_rules! integer_dct_kernel {
     };
 }
 
-#[cfg(all(feature = "neon", target_arch = "aarch64"))]
-pub(crate) use integer_dct_kernel;
-
 macro_rules! scalar_integer_dct {
     ($kernel:ident, $transform:ident, $int:ty) => {
         integer_dct_kernel!($kernel, $int);
@@ -171,6 +168,13 @@ macro_rules! scalar_integer_dct {
 scalar_integer_dct!(scalar_kernel_i32, scalar_dct_i32, i32);
 scalar_integer_dct!(scalar_kernel_i64, scalar_dct_i64, i64);
 
+#[cfg(all(feature = "neon", target_arch = "aarch64"))]
+pub(crate) fn fdct_neon(data: &mut AlignedBlock) {
+    // Continuation may exceed the normal byte range, so share the precise
+    // transform's ten-bit bound check and wide fallback before narrowing.
+    data.data = fdct_precise(data).map(|value| value as i16);
+}
+
 pub fn fdct_scalar(data: &mut AlignedBlock) {
     data.data = scalar_dct_i32(data).map(|value| value as i16);
 }
@@ -185,7 +189,8 @@ pub(crate) fn fdct_precise(data: &AlignedBlock) -> [i32; 64] {
         // The LL&M i32 bound permits ten-bit input samples with PASS1_BITS=2.
         #[cfg(all(feature = "neon", target_arch = "aarch64"))]
         {
-            neon::fdct_precise(data)
+            // SAFETY: NEON is part of the AArch64 baseline.
+            unsafe { neon::fdct_precise(data) }
         }
         #[cfg(not(all(feature = "neon", target_arch = "aarch64")))]
         {
@@ -199,7 +204,41 @@ pub(crate) fn fdct_precise(data: &AlignedBlock) -> [i32; 64] {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+
+    #[cfg(any(
+        all(feature = "neon", target_arch = "aarch64"),
+        all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64"))
+    ))]
+    pub(crate) fn check_precise_simd(transform: impl Fn(&AlignedBlock) -> [i32; 64]) {
+        // The independent wide scalar kernel also detects intermediate overflow.
+        let check = |input: [i16; 64]| {
+            let block = AlignedBlock::new(input);
+            assert_eq!(transform(&block), scalar_dct_i64(&block).map(|v| v as i32));
+        };
+        for value in [-512, -511, -1, 0, 1, 510, 511, 512] {
+            check([value; 64]);
+        }
+        for position in 0..64 {
+            for value in [-512, 512] {
+                let mut impulse = [0; 64];
+                impulse[position] = value;
+                check(impulse);
+            }
+        }
+        for pattern in 0..8 {
+            check(core::array::from_fn(|i| {
+                if (i >> pattern) & 1 == 0 { -512 } else { 512 }
+            }));
+        }
+        let mut seed = 0x31415926u32;
+        for _ in 0..4096 {
+            check(core::array::from_fn(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 16) % 1025) as i16 - 512
+            }));
+        }
+    }
 
     // Inputs and outputs are taken from libjpegs jpeg_fdct_islow for a typical image
 

@@ -44,6 +44,7 @@ mod polish;
 mod progressive;
 mod quantization;
 mod rdo;
+mod simd;
 mod writer;
 
 pub use clip::ClipOptions;

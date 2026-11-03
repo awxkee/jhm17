@@ -55,43 +55,63 @@ fn load_rgb<const N: usize, const R: usize, const G: usize, const B: usize>(
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn convert4<const MODE: u8>(r: int16x4_t, g: int16x4_t, b: int16x4_t) -> [uint16x4_t; 3] {
-    // The matrix rows sum to 65536, 0, 0 respectively. Factoring out
-    // green reduces nine multiplies to four without changing any integer bits.
-    let rg = vsub_s16(r, g);
-    let bg = vsub_s16(b, g);
-    let y = vmlal_n_s16(
-        vmlal_n_s16(vshlq_n_s32::<16>(vmovl_s16(g)), rg, 19595),
-        bg,
-        7471,
-    );
-    let offset = vdupq_n_s32(128 << 16);
-    let cb = vmlsl_n_s16(vaddq_s32(offset, vshll_n_s16::<15>(bg)), rg, 11059);
-    let cr = vmlsl_n_s16(vaddq_s32(offset, vshll_n_s16::<15>(rg)), bg, 5329);
-    let narrow = |value: int32x4_t, fractional: bool| {
-        let rounding = vdupq_n_s32(if fractional { 127 } else { 0x7fff });
-        let value = vreinterpretq_u32_s32(vaddq_s32(value, rounding));
-        if fractional {
-            vshrn_n_u32::<8>(value)
-        } else if MODE == 0 {
-            vshrn_n_u32::<16>(value)
+fn narrow<const MODE: u8>(lo: int32x4_t, hi: int32x4_t, fractional: bool) -> uint16x8_t {
+    // The scalar conversion rounds half steps down, hence one less than the
+    // usual rounding bias. All matrix outputs are nonnegative and fit in u16.
+    let bias = vdupq_n_s32(if fractional { 127 } else { 0x7fff });
+    let lo = vreinterpretq_u32_s32(vaddq_s32(lo, bias));
+    let hi = vreinterpretq_u32_s32(vaddq_s32(hi, bias));
+    if fractional {
+        vshrn_high_n_u32::<8>(vshrn_n_u32::<8>(lo), hi)
+    } else {
+        let integer = vshrn_high_n_u32::<16>(vshrn_n_u32::<16>(lo), hi);
+        if MODE == 0 {
+            integer
         } else {
-            vshl_n_u16::<8>(vshrn_n_u32::<16>(value))
+            vshlq_n_u16::<8>(integer)
         }
-    };
-    [
-        narrow(y, MODE != 0),
-        narrow(cb, MODE == 2),
-        narrow(cr, MODE == 2),
-    ]
+    }
 }
 
 #[inline]
 #[target_feature(enable = "neon")]
 fn convert8<const MODE: u8>([r, g, b]: [int16x8_t; 3]) -> [uint16x8_t; 3] {
-    let lo = convert4::<MODE>(vget_low_s16(r), vget_low_s16(g), vget_low_s16(b));
-    let hi = convert4::<MODE>(vget_high_s16(r), vget_high_s16(g), vget_high_s16(b));
-    core::array::from_fn(|c| vcombine_u16(lo[c], hi[c]))
+    // The matrix rows sum to 65536, 0, 0. Factoring out green reduces
+    // nine multiplies to four, with native widening operations for both halves.
+    let rg = vsubq_s16(r, g);
+    let bg = vsubq_s16(b, g);
+    let y_lo = vmlal_n_s16(
+        vmlal_n_s16(
+            vshlq_n_s32::<16>(vmovl_s16(vget_low_s16(g))),
+            vget_low_s16(rg),
+            19595,
+        ),
+        vget_low_s16(bg),
+        7471,
+    );
+    let y_hi = vmlal_high_n_s16(
+        vmlal_high_n_s16(vshlq_n_s32::<16>(vmovl_high_s16(g)), rg, 19595),
+        bg,
+        7471,
+    );
+    let offset = vdupq_n_s32(128 << 16);
+    let cb_lo = vmlsl_n_s16(
+        vaddq_s32(offset, vshll_n_s16::<15>(vget_low_s16(bg))),
+        vget_low_s16(rg),
+        11059,
+    );
+    let cb_hi = vmlsl_high_n_s16(vaddq_s32(offset, vshll_high_n_s16::<15>(bg)), rg, 11059);
+    let cr_lo = vmlsl_n_s16(
+        vaddq_s32(offset, vshll_n_s16::<15>(vget_low_s16(rg))),
+        vget_low_s16(bg),
+        5329,
+    );
+    let cr_hi = vmlsl_high_n_s16(vaddq_s32(offset, vshll_high_n_s16::<15>(rg)), bg, 5329);
+    [
+        narrow::<MODE>(y_lo, y_hi, MODE != 0),
+        narrow::<MODE>(cb_lo, cb_hi, MODE == 2),
+        narrow::<MODE>(cr_lo, cr_hi, MODE == 2),
+    ]
 }
 
 #[target_feature(enable = "neon")]

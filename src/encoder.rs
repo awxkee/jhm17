@@ -871,10 +871,12 @@ impl<W: JfifWrite> Encoder<W> {
             usize::from(image.height()),
             specs,
             options,
+            self.functions.float_dct,
+            self.functions.islow,
         ) else {
             return;
         };
-        // Exchange rates from two encodes at neighbouring qualities
+        // Exchange rates from two encodes at neighboring qualities
         let lo = self.quality.saturating_sub(options.quality_step).max(1);
         let hi = self.quality.saturating_add(options.quality_step).min(100);
         if lo == hi {
@@ -2252,6 +2254,8 @@ struct EncoderFunctions<W: JfifWrite> {
     fdct: fn(&mut AlignedBlock),
     fdct_precise: fn(&AlignedBlock) -> [i32; 64],
     float_dct: Transforms,
+    #[cfg(feature = "polish")]
+    islow: crate::idct::Islow,
     rgb: EncodeRgb<W>,
     rgba: EncodeRgb<W>,
     bgr: EncodeRgb<W>,
@@ -2260,12 +2264,19 @@ struct EncoderFunctions<W: JfifWrite> {
 
 impl<W: JfifWrite> EncoderFunctions<W> {
     fn new() -> Self {
-        let functions = Self::scalar(Transforms::new());
+        let cpu = crate::simd::CpuFeatures::detect();
+        let functions = Self::scalar(Transforms::for_cpu(cpu));
+        #[cfg(feature = "polish")]
+        let functions = Self {
+            islow: crate::idct::islow_for_cpu(cpu),
+            ..functions
+        };
         #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
-        if std::is_x86_feature_detected!("avx2") {
+        if cpu.avx2() {
             use crate::avx2::*;
             return Self {
                 fdct: fdct_avx2,
+                fdct_precise: fdct_precise_avx2,
                 rgb: |e, data, w, h| e.encode_image(RgbImageAVX2(data, w, h)),
                 rgba: |e, data, w, h| e.encode_image(RgbaImageAVX2(data, w, h)),
                 bgr: |e, data, w, h| e.encode_image(BgrImageAVX2(data, w, h)),
@@ -2277,6 +2288,7 @@ impl<W: JfifWrite> EncoderFunctions<W> {
         {
             use crate::neon::*;
             Self {
+                fdct: crate::fdct::fdct_neon,
                 rgb: |e, data, w, h| e.encode_image(RgbImageNEON(data, w, h)),
                 rgba: |e, data, w, h| e.encode_image(RgbaImageNEON(data, w, h)),
                 bgr: |e, data, w, h| e.encode_image(BgrImageNEON(data, w, h)),
@@ -2293,6 +2305,8 @@ impl<W: JfifWrite> EncoderFunctions<W> {
             fdct: crate::fdct::fdct,
             fdct_precise: crate::fdct::fdct_precise,
             float_dct,
+            #[cfg(feature = "polish")]
+            islow: crate::idct::islow_scalar,
             rgb: |e, data, w, h| e.encode_image(RgbImage(data, w, h)),
             rgba: |e, data, w, h| e.encode_image(RgbaImage(data, w, h)),
             bgr: |e, data, w, h| e.encode_image(BgrImage(data, w, h)),
@@ -2742,6 +2756,76 @@ mod progressive_tests {
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
+
+    #[cfg(feature = "polish")]
+    #[test]
+    fn polish_reuses_encoder_transforms_without_detecting_again() {
+        use core::cell::Cell;
+
+        std::thread_local! {
+            static CALLS: Cell<[usize; 2]> = const { Cell::new([0; 2]) };
+        }
+        fn forward(input: &[f32; 64], out: &mut [f32; 64]) {
+            CALLS.with(|calls| {
+                let mut count = calls.get();
+                count[0] += 1;
+                calls.set(count);
+            });
+            crate::dct_f32::scalar::<false>(input, out);
+        }
+        fn islow(levels: &[i16; 64], table: &[u16; 64], out: &mut [u8; 64]) {
+            CALLS.with(|calls| {
+                let mut count = calls.get();
+                count[1] += 1;
+                calls.set(count);
+            });
+            crate::idct::islow_scalar(levels, table, out);
+        }
+
+        let (width, height) = (33u16, 25u16);
+        let data: Vec<u8> = (0..usize::from(width) * usize::from(height) * 3)
+            .map(|i| (i * 37 + i / 11) as u8)
+            .collect();
+        let before = crate::simd::CpuFeatures::detection_count();
+        let mut output = Vec::new();
+        let mut encoder = Encoder::new(&mut output, 60);
+        assert_eq!(crate::simd::CpuFeatures::detection_count(), before + 1);
+        encoder.functions.float_dct =
+            Transforms::from_functions(forward, crate::dct_f32::scalar::<true>);
+        encoder.functions.islow = islow;
+        // Only the polisher should call the counted floating transform.
+        let mut rdo = RdoOptions::default();
+        rdo.clip.iterations = 0;
+        encoder.set_rdo(Some(rdo));
+        encoder.set_polish(crate::Polish::Custom(crate::PolishOptions {
+            judge: crate::PolishJudge::Ssimulacra2,
+            proposals: 1,
+            rounds: 1,
+            scan_limit: 3,
+            ..crate::PolishOptions::default()
+        }));
+        let stats = std::sync::Arc::new(std::sync::Mutex::new(None));
+        encoder.set_polish_stats_sink(stats.clone());
+        CALLS.with(|calls| calls.set([0; 2]));
+        encoder
+            .encode(&data, width, height, ColorType::Rgb)
+            .unwrap();
+
+        assert_eq!(crate::simd::CpuFeatures::detection_count(), before + 1);
+        let [forward, inverse] = CALLS.with(Cell::get);
+        assert!(forward > 0, "polish must use the encoder's floating DCT");
+        // Three frames decode the source blocks: both calibration qualities
+        // and the final polish frame. Candidate evaluation may add more calls.
+        let blocks = usize::from(width).div_ceil(16) * usize::from(height).div_ceil(16) * 6;
+        assert!(
+            inverse >= 3 * blocks,
+            "all polish frames must reuse the IDCT"
+        );
+        assert!(stats.lock().unwrap().is_some(), "polish must finish");
+        jpeg_decoder::Decoder::new(output.as_slice())
+            .decode()
+            .unwrap();
+    }
 
     #[test]
     fn resolved_functions_preserve_scalar_bitstreams() {

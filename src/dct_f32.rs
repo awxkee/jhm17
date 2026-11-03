@@ -27,12 +27,16 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#[cfg(any(test, not(all(feature = "neon", target_arch = "aarch64"))))]
 use core::ops::{Add, Mul, Sub};
 
 #[cfg(test)]
 #[path = "dct_f32/reference.rs"]
 pub(crate) mod reference;
 
+#[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+#[path = "dct_f32/avx2.rs"]
+mod avx2;
 #[cfg(all(feature = "neon", target_arch = "aarch64"))]
 #[path = "dct_f32/neon.rs"]
 mod neon;
@@ -40,12 +44,15 @@ mod neon;
 #[path = "dct_f32/sse2.rs"]
 mod sse2;
 
+#[cfg(any(test, not(all(feature = "neon", target_arch = "aarch64"))))]
 pub(super) trait Lane:
     Copy + Add<Output = Self> + Sub<Output = Self> + Mul<f32, Output = Self>
 {
 }
+#[cfg(any(test, not(all(feature = "neon", target_arch = "aarch64"))))]
 impl Lane for f32 {}
 
+#[cfg(any(test, not(all(feature = "neon", target_arch = "aarch64"))))]
 #[inline(always)]
 pub(super) fn forward<T: Lane>(x: [T; 8]) -> [T; 8] {
     let t0 = x[0] + x[7];
@@ -81,6 +88,7 @@ pub(super) fn forward<T: Lane>(x: [T; 8]) -> [T; 8] {
     [y0, y1, y2, y3, y4, y5, y6, y7]
 }
 
+#[cfg(any(test, not(all(feature = "neon", target_arch = "aarch64"))))]
 #[inline(always)]
 pub(super) fn inverse<T: Lane>(y: [T; 8]) -> [T; 8] {
     let t10 = y[0] + y[4];
@@ -116,6 +124,7 @@ pub(super) fn inverse<T: Lane>(y: [T; 8]) -> [T; 8] {
     ]
 }
 
+#[cfg(any(test, not(all(feature = "neon", target_arch = "aarch64"))))]
 #[inline(always)]
 pub(super) fn kernel<T: Lane, const INVERSE: bool>(input: [T; 8]) -> [T; 8] {
     if INVERSE {
@@ -144,23 +153,16 @@ pub(crate) fn scalar<const INVERSE: bool>(input: &[f32; 64], out: &mut [f32; 64]
     }
 }
 
-// Implementations are private: the SSE2 implementation is reached only after
-// feature detection, and NEON is baseline on AArch64. Every load/store receives
-// exactly four floats, so neither alignment nor an extra readable row is needed.
-#[cfg(any(
-    all(feature = "neon", target_arch = "aarch64"),
-    all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64"))
-))]
+// The private SSE2 lanes are used only after feature detection. Every
+// load/store receives exactly four floats, without extra alignment or padding.
+#[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
 trait Lane4: Lane {
     fn load(input: &[f32; 4]) -> Self;
     fn store(self, out: &mut [f32; 4]);
     fn transpose(input: [Self; 4]) -> [Self; 4];
 }
 
-#[cfg(any(
-    all(feature = "neon", target_arch = "aarch64"),
-    all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64"))
-))]
+#[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
 #[inline(always)]
 fn four_lane<T: Lane4, const INVERSE: bool>(input: &[f32; 64], out: &mut [f32; 64]) {
     let chunks = input.as_chunks::<4>().0;
@@ -196,7 +198,8 @@ pub(crate) struct Transforms {
 }
 
 impl Transforms {
-    pub(crate) fn new() -> Self {
+    /// Select both transforms from the encoder's already detected capabilities.
+    pub(crate) fn for_cpu(_cpu: crate::simd::CpuFeatures) -> Self {
         #[cfg(all(feature = "neon", target_arch = "aarch64"))]
         {
             Self {
@@ -206,8 +209,17 @@ impl Transforms {
         }
         #[cfg(not(all(feature = "neon", target_arch = "aarch64")))]
         {
+            #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+            if _cpu.avx2() {
+                return Self {
+                    // SAFETY: these private pointers are installed only after
+                    // establishing AVX2 support, and retained for all calls.
+                    forward: |input, out| unsafe { avx2::transform::<false>(input, out) },
+                    inverse: |input, out| unsafe { avx2::transform::<true>(input, out) },
+                };
+            }
             #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
-            if std::is_x86_feature_detected!("sse2") {
+            if _cpu.sse2() {
                 return Self {
                     // SAFETY: these private pointers are installed only after
                     // establishing SSE2 support, and retained for all calls.
@@ -223,11 +235,21 @@ impl Transforms {
     }
 
     #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self::for_cpu(crate::simd::CpuFeatures::detect())
+    }
+
+    #[cfg(test)]
     pub(crate) fn scalar() -> Self {
         Self {
             forward: scalar::<false>,
             inverse: scalar::<true>,
         }
+    }
+
+    #[cfg(all(test, feature = "polish"))]
+    pub(crate) fn from_functions(forward: Transform, inverse: Transform) -> Self {
+        Self { forward, inverse }
     }
 
     #[inline]

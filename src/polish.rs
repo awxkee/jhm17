@@ -295,6 +295,7 @@ impl Frame {
         specs: &[PlaneSpec],
         blocks: &[Vec<AlignedBlock>],
         tables: &[[u16; 64]],
+        islow: crate::idct::Islow,
     ) -> Self {
         let mut frame = Frame {
             width,
@@ -306,7 +307,7 @@ impl Frame {
                 .collect(),
             rgb: vec![0u8; width * height * 3],
             colors: ColorTables::new(),
-            islow: crate::idct::islow(),
+            islow,
         };
         for (c, spec) in specs.iter().enumerate() {
             for (b, block) in blocks[c][..spec.padded_cols * spec.padded_rows]
@@ -589,6 +590,7 @@ pub(crate) struct Polisher<'a> {
     specs: Vec<PlaneSpec>,
     source: &'a [[u8; 3]],
     transforms: Transforms,
+    islow: crate::idct::Islow,
     dense_basis: Option<[[f32; 8]; 8]>,
     ss2: Option<ssimu2_lite::PreparedReference>,
     cvvdp: Option<cvvdp_lite::PreparedReference>,
@@ -663,6 +665,8 @@ impl<'a> Polisher<'a> {
         height: usize,
         specs: Vec<PlaneSpec>,
         options: PolishOptions,
+        transforms: Transforms,
+        islow: crate::idct::Islow,
     ) -> Option<Self> {
         let image = ssimu2_lite::RgbImage::srgb8(source, width, height, width * 3).ok()?;
         let ss2 = ssimu2_lite::PreparedReference::new(image).ok()?;
@@ -676,7 +680,8 @@ impl<'a> Polisher<'a> {
             height,
             specs,
             source: source[..width * height * 3].as_chunks::<3>().0,
-            transforms: Transforms::new(),
+            transforms,
+            islow,
             dense_basis: (options.restore_threshold <= 0.0).then(dense_basis),
             ss2: Some(ss2),
             cvvdp: Some(cvvdp),
@@ -809,7 +814,14 @@ impl<'a> Polisher<'a> {
         blocks: &[Vec<AlignedBlock>],
         tables: &[[u16; 64]],
     ) -> (u64, f64, f64) {
-        let frame = Frame::new(self.width, self.height, &self.specs, blocks, tables);
+        let frame = Frame::new(
+            self.width,
+            self.height,
+            &self.specs,
+            blocks,
+            tables,
+            self.islow,
+        );
         let (_, _, bits) = self.lengths(blocks);
         let ss2 = self
             .ss2
@@ -985,7 +997,14 @@ impl<'a> Polisher<'a> {
         } else if o.judge == PolishJudge::Ssimulacra2 {
             self.cvvdp = None;
         }
-        let frame = Frame::new(self.width, self.height, &self.specs, blocks, tables);
+        let frame = Frame::new(
+            self.width,
+            self.height,
+            &self.specs,
+            blocks,
+            tables,
+            self.islow,
+        );
         let (_, ac_len, total_bits) = self.lengths(blocks);
         let use_ss2 = o.judge != PolishJudge::Cvvdp;
         let use_cv = o.judge != PolishJudge::Ssimulacra2;
@@ -1741,6 +1760,8 @@ mod tests {
                     height,
                     specs.clone(),
                     PolishOptions::default(),
+                    Transforms::new(),
+                    crate::idct::islow(),
                 )
                 .unwrap();
                 for (c, spec) in specs.iter().enumerate() {
@@ -1858,14 +1879,22 @@ mod tests {
                     judge,
                     ..PolishOptions::default()
                 };
-                let polisher =
-                    Polisher::new(&source, width, height, specs.clone(), options).unwrap();
+                let polisher = Polisher::new(
+                    &source,
+                    width,
+                    height,
+                    specs.clone(),
+                    options,
+                    Transforms::new(),
+                    crate::idct::islow(),
+                )
+                .unwrap();
                 let mut blocks: Vec<_> = specs
                     .iter()
                     .map(|s| vec![AlignedBlock { data: [0; 64] }; s.padded_cols * s.padded_rows])
                     .collect();
                 let tables = [[16; 64]; 3];
-                let frame = Frame::new(width, height, &specs, &blocks, &tables);
+                let frame = Frame::new(width, height, &specs, &blocks, &tables, polisher.islow);
                 let ss2 = (judge != PolishJudge::Cvvdp).then(|| {
                     polisher
                         .ss2
@@ -1950,7 +1979,8 @@ mod tests {
                                 old_scores
                             );
                         }
-                        let expected = Frame::new(width, height, &specs, &blocks, &tables);
+                        let expected =
+                            Frame::new(width, height, &specs, &blocks, &tables, polisher.islow);
                         assert_eq!(state.frame.rgb, expected.rgb);
                         assert_eq!(state.frame.planes, expected.planes);
                         if let Some(ss2) = &state.ss2 {

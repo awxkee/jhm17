@@ -58,8 +58,8 @@ const F3_072: i32 = 25172;
 /// row-major samples
 pub(crate) type Islow = fn(&[i16; 64], &[u16; 64], &mut [u8; 64]);
 
-/// The fastest available version, detected once by the caller.
-pub(crate) fn islow() -> Islow {
+/// Select the inverse transform from the encoder's already detected capabilities.
+pub(crate) fn islow_for_cpu(_cpu: crate::simd::CpuFeatures) -> Islow {
     #[cfg(all(feature = "neon", target_arch = "aarch64"))]
     {
         // SAFETY: NEON is baseline on AArch64.
@@ -68,17 +68,22 @@ pub(crate) fn islow() -> Islow {
     #[cfg(not(all(feature = "neon", target_arch = "aarch64")))]
     {
         #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
-        if std::is_x86_feature_detected!("avx2") {
+        if _cpu.avx2() {
             // SAFETY: installed only after establishing AVX2 support.
             return |levels, table, out| unsafe { avx2::islow(levels, table, out) };
         }
         #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
-        if std::is_x86_feature_detected!("sse4.1") {
+        if _cpu.sse41() {
             // SAFETY: installed only after establishing SSE4.1 support.
             return |levels, table, out| unsafe { sse41::islow(levels, table, out) };
         }
         islow_scalar
     }
+}
+
+#[cfg(test)]
+pub(crate) fn islow() -> Islow {
+    islow_for_cpu(crate::simd::CpuFeatures::detect())
 }
 
 /// The zigzag scan as natural-order indices (`writer::ZIGZAG`, computable
@@ -200,12 +205,9 @@ pub(crate) fn pass(i: [i32; 8], shift: i32) -> [i32; 8] {
 /// [`pass`] on eight lanes at once. Each ISA module defines `add`, `sub`,
 /// `mul` (by a constant), `shl13` and `descale::<SHIFT>` for its row type
 /// `R`, all wrapping, and invokes this inside its target-feature scope.
-#[cfg(any(
-    all(feature = "neon", target_arch = "aarch64"),
-    all(
-        any(feature = "avx2", feature = "sse"),
-        any(target_arch = "x86", target_arch = "x86_64")
-    )
+#[cfg(all(
+    any(feature = "avx2", feature = "sse"),
+    any(target_arch = "x86", target_arch = "x86_64")
 ))]
 macro_rules! vector_pass {
     ($feature:literal) => {
@@ -284,49 +286,55 @@ mod neon {
         table
     };
 
-    /// Eight i32 lanes: columns 0..4 and 4..8 of one row
-    type R = [int32x4_t; 2];
-
+    /// Four independent integer inverse transforms, one per NEON lane.
     #[inline]
     #[target_feature(enable = "neon")]
-    fn add(a: R, b: R) -> R {
-        [vaddq_s32(a[0], b[0]), vaddq_s32(a[1], b[1])]
-    }
+    fn pass<const SHIFT: i32>(i: [int32x4_t; 8]) -> [int32x4_t; 8] {
+        use super::{
+            F0_298, F0_390, F0_541, F0_765, F0_899, F1_175, F1_501, F1_847, F1_961, F2_053, F2_562,
+            F3_072,
+        };
+        let z1 = vmulq_n_s32(vaddq_s32(i[2], i[6]), F0_541);
+        let tmp2 = vmlsq_n_s32(z1, i[6], F1_847);
+        let tmp3 = vmlaq_n_s32(z1, i[2], F0_765);
+        let tmp0 = vshlq_n_s32::<13>(vaddq_s32(i[0], i[4]));
+        let tmp1 = vshlq_n_s32::<13>(vsubq_s32(i[0], i[4]));
+        let tmp10 = vaddq_s32(tmp0, tmp3);
+        let tmp13 = vsubq_s32(tmp0, tmp3);
+        let tmp11 = vaddq_s32(tmp1, tmp2);
+        let tmp12 = vsubq_s32(tmp1, tmp2);
 
-    #[inline]
-    #[target_feature(enable = "neon")]
-    fn sub(a: R, b: R) -> R {
-        [vsubq_s32(a[0], b[0]), vsubq_s32(a[1], b[1])]
-    }
+        let z1 = vmulq_n_s32(vaddq_s32(i[7], i[1]), -F0_899);
+        let z2 = vmulq_n_s32(vaddq_s32(i[5], i[3]), -F2_562);
+        let z3 = vaddq_s32(i[7], i[3]);
+        let z4 = vaddq_s32(i[5], i[1]);
+        let z5 = vmulq_n_s32(vaddq_s32(z3, z4), F1_175);
+        let z3 = vmlsq_n_s32(z5, z3, F1_961);
+        let z4 = vmlsq_n_s32(z5, z4, F0_390);
+        let t0 = vmlaq_n_s32(vaddq_s32(z1, z3), i[7], F0_298);
+        let t1 = vmlaq_n_s32(vaddq_s32(z2, z4), i[5], F2_053);
+        let t2 = vmlaq_n_s32(vaddq_s32(z2, z3), i[3], F3_072);
+        let t3 = vmlaq_n_s32(vaddq_s32(z1, z4), i[1], F1_501);
 
-    #[inline]
-    #[target_feature(enable = "neon")]
-    fn mul(a: R, c: i32) -> R {
-        [vmulq_n_s32(a[0], c), vmulq_n_s32(a[1], c)]
-    }
-
-    #[inline]
-    #[target_feature(enable = "neon")]
-    fn shl13(a: R) -> R {
-        [vshlq_n_s32::<13>(a[0]), vshlq_n_s32::<13>(a[1])]
-    }
-
-    #[inline]
-    #[target_feature(enable = "neon")]
-    fn descale<const N: i32>(a: R) -> R {
-        // Wrapping add then arithmetic shift, as the scalar `descale`.
-        let round = vdupq_n_s32(1 << (N - 1));
+        let round = vdupq_n_s32(1 << (SHIFT - 1));
         [
-            vshrq_n_s32::<N>(vaddq_s32(a[0], round)),
-            vshrq_n_s32::<N>(vaddq_s32(a[1], round)),
+            vaddq_s32(tmp10, t3),
+            vaddq_s32(tmp11, t2),
+            vaddq_s32(tmp12, t1),
+            vaddq_s32(tmp13, t0),
+            vsubq_s32(tmp13, t0),
+            vsubq_s32(tmp12, t1),
+            vsubq_s32(tmp11, t2),
+            vsubq_s32(tmp10, t3),
         ]
+        // Keep the wrapping addition before the shift. A rounding-shift
+        // instruction differs when the rounding addition overflows i32.
+        .map(|value| vshrq_n_s32::<SHIFT>(vaddq_s32(value, round)))
     }
-
-    vector_pass!("neon");
 
     #[inline]
     #[target_feature(enable = "neon")]
-    fn transpose4(a: int32x4_t, b: int32x4_t, c: int32x4_t, d: int32x4_t) -> [int32x4_t; 4] {
+    fn transpose([a, b, c, d]: [int32x4_t; 4]) -> [int32x4_t; 4] {
         let ab = vtrnq_s32(a, b);
         let cd = vtrnq_s32(c, d);
         [
@@ -334,25 +342,6 @@ mod neon {
             vcombine_s32(vget_low_s32(ab.1), vget_low_s32(cd.1)),
             vcombine_s32(vget_high_s32(ab.0), vget_high_s32(cd.0)),
             vcombine_s32(vget_high_s32(ab.1), vget_high_s32(cd.1)),
-        ]
-    }
-
-    #[inline]
-    #[target_feature(enable = "neon")]
-    fn transpose(r: [R; 8]) -> [R; 8] {
-        let tl = transpose4(r[0][0], r[1][0], r[2][0], r[3][0]);
-        let bl = transpose4(r[4][0], r[5][0], r[6][0], r[7][0]);
-        let tr = transpose4(r[0][1], r[1][1], r[2][1], r[3][1]);
-        let br = transpose4(r[4][1], r[5][1], r[6][1], r[7][1]);
-        [
-            [tl[0], bl[0]],
-            [tl[1], bl[1]],
-            [tl[2], bl[2]],
-            [tl[3], bl[3]],
-            [tr[0], br[0]],
-            [tr[1], br[1]],
-            [tr[2], br[2]],
-            [tr[3], br[3]],
         ]
     }
 
@@ -365,9 +354,8 @@ mod neon {
             let bytes = levels.as_ptr().cast::<u8>();
             (vld1q_u8_x4(bytes), vld1q_u8_x4(bytes.add(64)))
         };
-        let steps = table.as_chunks::<8>().0;
-        let mut r = [[vdupq_n_s32(0); 2]; 8];
-        for (y, row) in r.iter_mut().enumerate() {
+        let mut halves = [[vdupq_n_s32(0); 8]; 2];
+        for y in 0..8 {
             // SAFETY: each index row holds 16 bytes and each step row 8 u16.
             let (natural, step) = unsafe {
                 let gather = &GATHER[y];
@@ -375,29 +363,86 @@ mod neon {
                     vqtbl4q_u8(lo, vld1q_u8(gather[0].as_ptr())),
                     vqtbl4q_u8(hi, vld1q_u8(gather[1].as_ptr())),
                 );
-                (vreinterpretq_s16_u8(bytes), vld1q_u16(steps[y].as_ptr()))
+                (
+                    vreinterpretq_s16_u8(bytes),
+                    vld1q_u16(table.as_ptr().add(y * 8)),
+                )
             };
-            *row = [
-                vmulq_s32(
-                    vmovl_s16(vget_low_s16(natural)),
-                    vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(step))),
-                ),
-                vmulq_s32(
-                    vmovl_high_s16(natural),
-                    vreinterpretq_s32_u32(vmovl_high_u16(step)),
-                ),
-            ];
-        }
-        let columns = pass::<PASS1_SHIFT>(r);
-        let rows = transpose(pass::<PASS2_SHIFT>(transpose(columns)));
-        let bias = vdupq_n_s32(128);
-        for (row, out) in rows.iter().zip(out.as_chunks_mut::<8>().0) {
-            let narrow = vcombine_s16(
-                vqmovn_s32(vaddq_s32(row[0], bias)),
-                vqmovn_s32(vaddq_s32(row[1], bias)),
+            halves[0][y] = vmulq_s32(
+                vmovl_s16(vget_low_s16(natural)),
+                vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(step))),
             );
-            // SAFETY: each output chunk holds exactly eight bytes.
-            unsafe { vst1_u8(out.as_mut_ptr(), vqmovun_s16(narrow)) };
+            halves[1][y] = vmulq_s32(
+                vmovl_high_s16(natural),
+                vreinterpretq_s32_u32(vmovl_high_u16(step)),
+            );
+        }
+        // Each pass handles four complete columns. Transpose four rows at a
+        // time for the horizontal pass, keeping every butterfly in native lanes.
+        let [left, right] = halves.map(|half| pass::<PASS1_SHIFT>(half));
+        let bias = vdupq_n_s32(128);
+        for y in [0, 4] {
+            let lo = transpose(core::array::from_fn(|i| left[y + i]));
+            let hi = transpose(core::array::from_fn(|i| right[y + i]));
+            let columns =
+                pass::<PASS2_SHIFT>([lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]]);
+            let lo = transpose(core::array::from_fn(|i| columns[i]));
+            let hi = transpose(core::array::from_fn(|i| columns[i + 4]));
+            for row in 0..4 {
+                let narrow = vcombine_s16(
+                    vqmovn_s32(vaddq_s32(lo[row], bias)),
+                    vqmovn_s32(vaddq_s32(hi[row], bias)),
+                );
+                // SAFETY: y + row identifies one complete eight-byte output row.
+                unsafe {
+                    vst1_u8(out.as_mut_ptr().add((y + row) * 8), vqmovun_s16(narrow));
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn native_pass_matches_scalar_with_wrapping_intermediates() {
+            let mut seed = 0x2545_f491_4f6c_dd1du64;
+            for case in 0..4096 {
+                let input: [[i32; 4]; 8] = core::array::from_fn(|i| {
+                    core::array::from_fn(|lane| {
+                        if case < 8 {
+                            let edges = [i32::MIN, i32::MAX, -1, 0, 1, 32767, -32768, 2047];
+                            edges[(case + i + lane) % edges.len()]
+                        } else {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            seed as i32
+                        }
+                    })
+                });
+                // SAFETY: each input and output array holds four complete lanes;
+                // NEON is baseline on AArch64.
+                unsafe {
+                    let vectors = input.map(|values| vld1q_s32(values.as_ptr()));
+                    for (shift, actual) in [
+                        (PASS1_SHIFT, pass::<PASS1_SHIFT>(vectors)),
+                        (PASS2_SHIFT, pass::<PASS2_SHIFT>(vectors)),
+                    ] {
+                        let actual = actual.map(|vector| {
+                            let mut values = [0; 4];
+                            vst1q_s32(values.as_mut_ptr(), vector);
+                            values
+                        });
+                        for lane in 0..4 {
+                            let scalar =
+                                super::super::pass(input.map(|values| values[lane]), shift);
+                            assert_eq!(actual.map(|values| values[lane]), scalar, "case {case}");
+                        }
+                    }
+                }
+            }
         }
     }
 }
