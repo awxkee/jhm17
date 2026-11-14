@@ -174,33 +174,44 @@ pub(crate) fn block_activity(coefficients: &AlignedBlock) -> f32 {
 /// Lowest median activity AQ measures against: a pixel standard deviation of
 /// one level (activity is `64² ·` variance).
 ///
-/// Images that are mostly flat (graphics, white backgrounds) have a median
-/// near zero, which would rank every smooth gradient block as busy and raise
-/// its λ until the gradient collapses into DC-only blocks, i.e. banding.
-/// Blocks below one level of deviation mask nothing, so their λ is never raised.
+/// Blocks below it mask nothing: their λ is never raised, and they are left
+/// out of the median. Images that are largely flat (graphics, white pages,
+/// black sky around a planet or asteroid) would otherwise pull the median
+/// down to the flat background, rank every textured block as busy and
+/// coarsen all of the actual content by the full `aq_max`; and a median of
+/// zero would raise smooth gradients until they collapse into DC-only blocks,
+/// i.e. banding.
 const AQ_MIN_MEDIAN_ACTIVITY: f32 = 4096.0;
 
-/// Per-block λ scales from block activities, relative to their median:
-/// `(activity / median)^(aq_strength / 2)`, clamped to `[aq_min, aq_max]`
+/// Per-block λ scales from block activities, relative to the median activity
+/// of the blocks with content: `(activity / median)^(aq_strength / 2)`,
+/// clamped to `[aq_min, aq_max]`
 pub(crate) fn aq_lambda_scales(activities: &[f32], options: &RdoOptions) -> Vec<f32> {
-    let mut selected = activities.to_vec();
+    let mut selected = Vec::with_capacity(activities.len());
+    selected.extend(
+        activities
+            .iter()
+            .copied()
+            .filter(|&a| a >= AQ_MIN_MEDIAN_ACTIVITY),
+    );
     let middle = selected.len() / 2;
     let median = if selected.is_empty() {
-        1.0
+        AQ_MIN_MEDIAN_ACTIVITY
     } else {
-        (*selected
+        *selected
             .select_nth_unstable_by(middle, |a, b| a.partial_cmp(b).unwrap())
-            .1)
-            .max(AQ_MIN_MEDIAN_ACTIVITY)
+            .1
     };
+    selected.clear();
+    selected.resize(activities.len(), 0.0);
     let (lo, hi) = (options.aq_min.min(options.aq_max), options.aq_max);
-    // Selection no longer needs its reordered values. Refill that allocation
-    // in original block order instead of allocating a separate scales vector.
+    let exponent = options.aq_strength * 0.5;
+    // Reuse the selection's allocation for the scales, in original block order.
     for (scale, &a) in selected.iter_mut().zip(activities) {
         *scale = if a <= 0.0 {
             lo
         } else {
-            pow_no_libm(a / median, options.aq_strength * 0.5).clamp(lo, hi)
+            pow_no_libm(a / median, exponent).clamp(lo, hi)
         };
     }
     selected
@@ -571,6 +582,30 @@ fn rdoq_with_coefficients(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aq_median_ignores_flat_background() {
+        // 70% black sky around textured content: the content's own median
+        // block must keep λ unscaled instead of being coarsened to aq_max.
+        let activities: Vec<f32> = (0..100)
+            .map(|i| {
+                if i < 70 {
+                    0.0
+                } else {
+                    4096.0 * (6.0 + (i % 5) as f32)
+                }
+            })
+            .collect();
+        let options = RdoOptions::default();
+        let scales = aq_lambda_scales(&activities, &options);
+        let mut content = scales[70..].to_vec();
+        content.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!(
+            (content[content.len() / 2] - 1.0).abs() < 1e-6,
+            "{content:?}"
+        );
+        assert!(scales[..70].iter().all(|&s| s == options.aq_min));
+    }
 
     #[test]
     fn aq_does_not_coarsen_gradients_on_flat_images() {
